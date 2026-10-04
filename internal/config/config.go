@@ -37,18 +37,19 @@ type Config struct {
 
 // Java describes the required runtime and how to start the application.
 type Java struct {
-	MinVersion      int      `json:"minVersion"`                // minimum feature release, e.g. 17
-	MaxVersion      int      `json:"maxVersion,omitempty"`      // maximum feature release (0 = any)
-	Image           string   `json:"image,omitempty"`           // "jre" (default) or "jdk" (requires javac)
-	DownloadVersion int      `json:"downloadVersion,omitempty"` // release to download if missing (default minVersion)
-	Download        []Source `json:"download,omitempty"`        // where to download a runtime from, in order
-	Runtime         string   `json:"runtime,omitempty"`         // build time: jlink image to bundle; may use {os},{arch},{platform}
-	Options         []string `json:"options,omitempty"`         // JVM options, e.g. "-Xmx512m"
-	Args            []string `json:"args,omitempty"`            // default application arguments
-	MainClass       string   `json:"mainClass,omitempty"`       // start a class instead of "-jar"
-	ClassPath       []string `json:"classPath,omitempty"`       // extra class path entries (with mainClass)
-	Module          string   `json:"module,omitempty"`          // modular app: "module/main.Class"
-	ModulePath      []string `json:"modulePath,omitempty"`      // module path entries (with module)
+	MinVersion      int               `json:"minVersion"`                // minimum feature release, e.g. 17
+	MaxVersion      int               `json:"maxVersion,omitempty"`      // maximum feature release (0 = any)
+	Image           string            `json:"image,omitempty"`           // "jre" (default) or "jdk" (requires javac)
+	DownloadVersion int               `json:"downloadVersion,omitempty"` // release to download if missing (default minVersion)
+	Download        []Source          `json:"download,omitempty"`        // where to download a runtime from, in order
+	Runtime         string            `json:"runtime,omitempty"`         // build time: jlink image to bundle; may use {os},{arch},{platform}
+	Options         []string          `json:"options,omitempty"`         // JVM options, e.g. "-Xmx512m"
+	Env             map[string]string `json:"env,omitempty"`             // environment variables for the app, e.g. SPRING_PROFILES_ACTIVE
+	Args            []string          `json:"args,omitempty"`            // default application arguments
+	MainClass       string            `json:"mainClass,omitempty"`       // start a class instead of "-jar"
+	ClassPath       []string          `json:"classPath,omitempty"`       // extra class path entries (with mainClass)
+	Module          string            `json:"module,omitempty"`          // modular app: "module/main.Class"
+	ModulePath      []string          `json:"modulePath,omitempty"`      // module path entries (with module)
 }
 
 // Source is a place to download a Java runtime from. In JSON it may be an
@@ -150,6 +151,9 @@ func Parse(data []byte, strict bool) (*Config, error) {
 	}
 	if err := dec.Decode(&c); err != nil {
 		return nil, err
+	}
+	if strict && c.Build != nil {
+		return nil, errors.New("\"build\" is written by jrunner build and must not be set")
 	}
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {

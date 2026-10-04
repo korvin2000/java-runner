@@ -79,6 +79,7 @@ reported as errors, so typos are caught at build time.
     "downloadVersion": 21,
     "download": ["adoptium", "zulu", "https://mirror.example.com/jre-{version}-{os}-{arch}.{ext}"],
     "options": ["-Xmx512m", "-Dlogging.file.name=${DATA_DIR}/logs/app.log"],
+    "env": { "SPRING_PROFILES_ACTIVE": "prod" },
     "args": []
   },
 
@@ -102,6 +103,7 @@ reported as errors, so typos are caught at build time.
 | `java.download` | Sources, tried in order. `adoptium` (Eclipse Temurin) and `zulu` (Azul) use the vendors' APIs and verify published SHA-256 checksums. A URL template may use `{version} {os} {arch} {image} {ext}` (`os` = windows/linux/mac, `arch` = x64/aarch64, `ext` = zip on Windows, else tar.gz). Object form: `{"url": "...", "sha256": "<hex or URL of a checksum file>"}`. Default: `["adoptium", "zulu"]` |
 | `java.runtime` | Build time: a jlink image to bundle (may contain `{os}`, `{arch}`, `{platform}`). The app then never searches for or downloads Java |
 | `java.options` / `args` | JVM options and default app arguments. `${APP_DIR}`, `${INSTALL_DIR}`, `${DATA_DIR}`, `${HOME}`, `${VERSION}`, `${ID}` and `${ENV_VAR}` are expanded |
+| `java.env` | Environment variables set for the application (same `${...}` expansion) |
 | `java.mainClass` + `classPath` | Start a class instead of `-jar` (entries relative to `app/`, `lib/*` allowed) |
 | `java.module` + `modulePath` | Modular app: `-p <modulePath> -m <module>/<main class>` |
 | `browser.url` | Web app (e.g. Spring Boot): after start, wait until the port accepts connections, then open the browser. If the port is already in use, the app is assumed to be running and only the browser is opened |
@@ -121,8 +123,13 @@ All arguments are passed to the application except these:
 --jrunner-help
 ```
 
-Extra JVM options can be set in an environment variable named after the
-id, e.g. `DEMO_APP_JAVA_OPTS="-Xmx2g"`.
+Users can tune the JVM without touching the configuration:
+
+* `<install dir>/<id>.vmoptions` – one JVM option per line (`#` comments), kept
+  across updates, e.g. `-Xmx2g`.
+* `<ID>_JAVA_OPTS` – extra JVM options, e.g. `DEMO_APP_JAVA_OPTS="-Xmx2g"`.
+* `<ID>_JAVA_HOME` – use this Java installation for the launch instead of the
+  discovered one (it is checked against the version requirement, not remembered).
 
 ## Updates
 
@@ -135,8 +142,15 @@ both next to each other at `update.url`:
 ```
 
 The launcher compares versions (semver-like: `1.10.0 > 1.9.2`, `2.0.0-rc1 < 2.0.0`),
-downloads the package, verifies its SHA-256 and atomically replaces `app/`. If
-the new version needs a newer Java, it is found or downloaded automatically.
+downloads the package, verifies its SHA-256, checks that the package really
+contains the announced version of this application and atomically replaces
+`app/`. If the new version needs a newer Java, it is found or downloaded
+automatically. Files in `app/` are replaced on update; keep user-editable
+configuration in `${DATA_DIR}` (the default working directory).
+
+In CI, pass the release version instead of editing the file:
+`jrunner build --target all --version 1.3.0`. Use an `https://` update URL;
+with plain `http://` the checksums in `update.json` can be tampered with.
 With a bundled runtime, packages are per platform (`"platforms": {"windows-x64": {...}}`).
 
 ## Minimal runtimes (jlink)

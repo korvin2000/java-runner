@@ -51,6 +51,7 @@ func (l *launcher) command(appArgs []string) (*exec.Cmd, error) {
 	inApp := func(p string) string { return filepath.Join(l.paths.App, filepath.FromSlash(p)) }
 
 	args := expandAll(c.Java.Options, vars)
+	args = append(args, expandAll(readVMOptions(l.vmOptionsFile()), vars)...)
 	if env := os.Getenv(envOptsName(c.ID)); env != "" {
 		args = append(args, strings.Fields(env)...)
 	}
@@ -93,7 +94,33 @@ func (l *launcher) command(appArgs []string) (*exec.Cmd, error) {
 	cmd := exec.Command(l.state.Java.Java(), args...)
 	cmd.Dir = dir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = os.Environ()
+	for k, v := range c.Java.Env {
+		cmd.Env = append(cmd.Env, k+"="+expand(v, vars))
+	}
 	return cmd, nil
+}
+
+// vmOptionsFile is a user-editable file with one JVM option per line, kept
+// next to the launcher (it survives updates, uninstall removes it).
+func (l *launcher) vmOptionsFile() string {
+	return filepath.Join(l.paths.Install, l.cfg.ID+".vmoptions")
+}
+
+// readVMOptions reads a .vmoptions file: one option per line, blank lines and
+// lines starting with '#' are ignored.
+func readVMOptions(name string) []string {
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return nil
+	}
+	var opts []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			opts = append(opts, line)
+		}
+	}
+	return opts
 }
 
 func (l *launcher) launchWeb(cmd *exec.Cmd) (int, error) {
@@ -219,7 +246,13 @@ func joinPaths(list []string, resolve func(string) string) string {
 
 // envOptsName is the environment variable with extra JVM options, e.g.
 // DEMO_APP_JAVA_OPTS for id "demo-app".
-func envOptsName(id string) string {
+func envOptsName(id string) string { return envPrefix(id) + "_JAVA_OPTS" }
+
+// envJavaHomeName is the environment variable that overrides the Java
+// installation, e.g. DEMO_APP_JAVA_HOME.
+func envJavaHomeName(id string) string { return envPrefix(id) + "_JAVA_HOME" }
+
+func envPrefix(id string) string {
 	return strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z':
@@ -228,5 +261,5 @@ func envOptsName(id string) string {
 			return r
 		}
 		return '_'
-	}, id) + "_JAVA_OPTS"
+	}, id)
 }

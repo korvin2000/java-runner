@@ -32,6 +32,7 @@ type Options struct {
 	Targets []string // platform keys; empty = current platform
 	Out     string   // output directory
 	Stubs   string   // directory with jrunner-<target> stubs for other platforms
+	Version string   // overrides the version in the configuration (CI builds)
 }
 
 type entry struct{ name, src string } // package entry name and source file
@@ -42,6 +43,15 @@ func Build(o Options) error {
 	cfg, err := config.Load(o.Config)
 	if err != nil {
 		return err
+	}
+	if o.Version != "" {
+		cfg.Version = strings.TrimSpace(o.Version)
+		if cfg.Version == "" {
+			return fmt.Errorf("--version must not be empty")
+		}
+	}
+	if u := cfg.Update; u != nil && !strings.HasPrefix(strings.ToLower(u.URL), "https://") {
+		ui.Warn("update.url %s is not https: update.json and its checksums could be tampered with in transit", u.URL)
 	}
 	base, err := filepath.Abs(filepath.Dir(o.Config))
 	if err != nil {
