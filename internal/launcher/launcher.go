@@ -174,9 +174,23 @@ func (l *launcher) installReason(installed *config.Config) string {
 }
 
 // ensureJava makes sure state.Java points to a usable runtime. The common
-// case costs one stat call.
+// case costs one stat call. <ID>_JAVA_HOME overrides discovery for this
+// launch without being remembered.
 func (l *launcher) ensureJava() error {
 	req := requirement(l.cfg)
+	if home := os.Getenv(envJavaHomeName(l.cfg.ID)); home != "" {
+		rt, err := jre.Probe(platform.ExpandHome(home))
+		if err != nil {
+			return fmt.Errorf("%s: %v", envJavaHomeName(l.cfg.ID), err)
+		}
+		if why := req.Check(rt); why != "" {
+			return fmt.Errorf("%s: %s", envJavaHomeName(l.cfg.ID), why)
+		}
+		rt.Source = "override"
+		ui.Debug("using %s from %s", rt, envJavaHomeName(l.cfg.ID))
+		l.state.Java = rt
+		return nil
+	}
 	if rt := l.state.Java; rt != nil && fsutil.IsFile(rt.Java()) && req.Accepts(rt) {
 		return nil
 	}
@@ -230,9 +244,14 @@ func requirement(c *config.Config) jre.Requirement {
 }
 
 // cleanup removes leftovers of replaced files (Windows keeps running
-// executables and open jars locked until the process exits).
+// executables and open jars locked until the process exits) and of
+// interrupted downloads.
 func (l *launcher) cleanup() {
-	for _, p := range []string{l.paths.Launcher + ".old", l.paths.App + ".old", l.paths.App + ".new", l.paths.Runtime + ".old"} {
+	for _, p := range []string{
+		l.paths.Launcher + ".old", l.paths.App + ".old", l.paths.App + ".new",
+		l.paths.Runtime + ".old", l.paths.Runtime + ".new", l.paths.Runtime + ".download", l.paths.Runtime + ".download.part",
+		filepath.Join(l.paths.Install, updateFile), filepath.Join(l.paths.Install, updateFile+".part"),
+	} {
 		if fsutil.Exists(p) {
 			_ = os.RemoveAll(p)
 		}
@@ -355,8 +374,9 @@ Launcher options:
   %[5]shelp        show this help
 
 All other arguments are passed to the application. Extra JVM options can be
-given in the environment variable %[6]s.
-`, l.cfg.Name, l.cfg.Version, version.Tool, filepath.Base(l.exe), flagPrefix, envOptsName(l.cfg.ID))
+put into %[6]s (one per line) or the environment variable %[7]s.
+%[8]s selects the Java installation to use for this launch.
+`, l.cfg.Name, l.cfg.Version, version.Tool, filepath.Base(l.exe), flagPrefix, l.vmOptionsFile(), envOptsName(l.cfg.ID), envJavaHomeName(l.cfg.ID))
 }
 
 func (l *launcher) printInfo(installed *config.Config) {
@@ -371,6 +391,9 @@ func (l *launcher) printInfo(installed *config.Config) {
 	fmt.Printf("Data dir:      %s\n", l.paths.Data)
 	if rt := l.state.Java; rt != nil {
 		fmt.Printf("Java:          %s [%s]\n", rt, rt.Source)
+	}
+	if opts := readVMOptions(l.vmOptionsFile()); len(opts) > 0 {
+		fmt.Printf("JVM options:   %s (%s)\n", strings.Join(opts, " "), l.vmOptionsFile())
 	}
 	if c := installed; c != nil && c.Update != nil {
 		last := "never"

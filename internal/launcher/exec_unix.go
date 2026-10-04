@@ -16,7 +16,11 @@ func execJava(cmd *exec.Cmd) (int, error) {
 	if err := os.Chdir(cmd.Dir); err != nil {
 		return 1, err
 	}
-	err := syscall.Exec(cmd.Path, cmd.Args, os.Environ())
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	err := syscall.Exec(cmd.Path, cmd.Args, env)
 	return 1, fmt.Errorf("starting Java: %w", err)
 }
 

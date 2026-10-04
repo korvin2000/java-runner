@@ -24,6 +24,7 @@ Usage:
       -t, --target LIST    comma-separated targets or "all" (default %s)
                            targets: %s
       -o, --out DIR        output directory (default dist)
+      --version VERSION    override the version in the configuration (CI builds)
       --stubs DIR          directory with jrunner-<target> stubs for other platforms
   jrunner jlink [options]                 create a minimal Java runtime with jlink
       --jar FILE           application jar (modules are detected with jdeps)
@@ -97,6 +98,7 @@ func cmdBuild(args []string) error {
 	fs.StringVar(&o.Out, "out", "dist", "output directory")
 	fs.StringVar(&o.Out, "o", "dist", "output directory")
 	fs.StringVar(&o.Stubs, "stubs", "", "stub directory")
+	fs.StringVar(&o.Version, "version", "", "version override")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}

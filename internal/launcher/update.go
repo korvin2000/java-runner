@@ -16,6 +16,9 @@ import (
 	"github.com/korvin2000/java-runner/internal/version"
 )
 
+// updateFile is the temporary name of a downloaded update package.
+const updateFile = ".update.zip"
+
 func (l *launcher) updateDue() bool {
 	u := l.cfg.Update
 	return u != nil && time.Since(l.state.LastUpdateCheck) >= u.Interval()
@@ -75,7 +78,7 @@ func (l *launcher) checkUpdate(forced bool) (bool, error) {
 		return false, err
 	}
 
-	file := filepath.Join(l.paths.Install, ".update.zip")
+	file := filepath.Join(l.paths.Install, updateFile)
 	defer os.Remove(file)
 	ui.Info("downloading %s", pkgURL)
 	if err := fetch.File(context.Background(), pkgURL, file, asset.SHA256); err != nil {
@@ -91,6 +94,10 @@ func (l *launcher) checkUpdate(forced bool) (bool, error) {
 		return false, fmt.Errorf("update package is for %q, not %q", p.Config.ID, l.cfg.ID)
 	case !p.HasApp:
 		return false, errors.New("update package contains no application files")
+	case version.Compare(p.Config.Version, m.Version) != 0:
+		return false, fmt.Errorf("update package contains version %s, but update.json announces %s", p.Config.Version, m.Version)
+	case p.Config.Build != nil && p.Config.Build.BundledRuntime != p.HasRuntime:
+		return false, errors.New("update package is inconsistent (bundled runtime)")
 	}
 	ui.Step("Installing %s %s", p.Config.Name, p.Config.Version)
 	if err := l.install(p, false); err != nil {

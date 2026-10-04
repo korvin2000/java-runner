@@ -125,8 +125,17 @@ func Find(req Requirement, preferred ...string) *Runtime {
 	if p, err := exec.LookPath(exe("java")); err == nil {
 		if real, err := filepath.EvalSymlinks(p); err == nil && !(runtime.GOOS == "darwin" && real == "/usr/bin/java") {
 			// /usr/bin/java on macOS is a stub that may prompt to install Java.
-			if r := try(filepath.Dir(filepath.Dir(real)), "system"); r != nil {
+			home := filepath.Dir(filepath.Dir(real))
+			if r := try(home, "system"); r != nil {
 				return r
+			}
+			// Not a Java home (e.g. Oracle's javapath shim on Windows): ask java itself.
+			if !fsutil.IsFile(filepath.Join(home, "bin", exe("java"))) {
+				if rt, err := probeJava(real); err == nil {
+					if r := try(rt.Home, "system"); r != nil {
+						return r
+					}
+				}
 			}
 		}
 	}
@@ -158,14 +167,26 @@ func Probe(home string) (*Runtime, error) {
 // ProbeExec runs java to determine its version and architecture. This also
 // proves that the runtime actually works on this machine.
 func ProbeExec(home string) (*Runtime, error) {
+	r, err := probeJava(filepath.Join(home, "bin", exe("java")))
+	if err != nil {
+		return nil, err
+	}
+	r.Home = home
+	return r, nil
+}
+
+// probeJava runs a java executable and reads version, vendor, architecture
+// and home from its system properties.
+func probeJava(java string) (*Runtime, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	java := filepath.Join(home, "bin", exe("java"))
-	out, err := exec.CommandContext(ctx, java, "-XshowSettings:properties", "-version").CombinedOutput()
+	cmd := exec.CommandContext(ctx, java, "-XshowSettings:properties", "-version")
+	cmd.Env = append(os.Environ(), "JAVA_TOOL_OPTIONS=", "_JAVA_OPTIONS=") // keep the output clean
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("%s does not run: %v %s", java, err, firstLine(out))
 	}
-	r := &Runtime{Home: home}
+	r := &Runtime{}
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), " = ")
@@ -179,9 +200,11 @@ func ProbeExec(home string) (*Runtime, error) {
 			r.Vendor = v
 		case "os.arch":
 			r.Arch = v
+		case "java.home":
+			r.Home = v
 		}
 	}
-	if r.Version == "" {
+	if r.Version == "" || r.Home == "" {
 		return nil, fmt.Errorf("%s: cannot determine Java version: %s", java, firstLine(out))
 	}
 	return r, nil
