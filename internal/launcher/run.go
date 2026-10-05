@@ -3,6 +3,7 @@ package launcher
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/korvin2000/java-runner/internal/fsutil"
@@ -30,8 +32,11 @@ func (l *launcher) launch(appArgs []string) (int, error) {
 	}
 	ui.Debug("working directory: %s", cmd.Dir)
 	ui.Debug("command: %s", strings.Join(cmd.Args, " "))
-	if l.cfg.Browser == nil {
+	if l.cfg.Browser == nil || l.opts.noBrowser {
 		return execJava(cmd)
+	}
+	if l.cfg.Browser.URL == "" {
+		return l.launchWebDetect(cmd)
 	}
 	return l.launchWeb(cmd)
 }
@@ -47,6 +52,9 @@ func (l *launcher) command(appArgs []string) (*exec.Cmd, error) {
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		vars["HOME"] = home
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		vars["CWD"] = cwd
 	}
 	inApp := func(p string) string { return filepath.Join(l.paths.App, filepath.FromSlash(p)) }
 
@@ -163,6 +171,66 @@ func (l *launcher) launchWeb(cmd *exec.Cmd) (int, error) {
 	return exitCode(err)
 }
 
+// launchWebDetect runs the application with its output watched for the URL
+// it listens on (see detect.go); once the port accepts connections the
+// browser is opened.
+func (l *launcher) launchWebDetect(cmd *exec.Cmd) (int, error) {
+	outR, outW := io.Pipe()
+	errR, errW := io.Pipe()
+	cmd.Stdout, cmd.Stderr = outW, errW
+	// The app writes to a pipe now and would turn its log colors off; tell
+	// Spring Boot that the output still ends up on a color terminal.
+	if ui.Colors() && platform.IsTerminal(os.Stdout) && os.Getenv("SPRING_OUTPUT_ANSI_ENABLED") == "" {
+		cmd.Env = append(cmd.Env, "SPRING_OUTPUT_ANSI_ENABLED=ALWAYS")
+	}
+	if err := cmd.Start(); err != nil {
+		return 1, fmt.Errorf("starting Java: %w", err)
+	}
+	stop := handleSignals(cmd.Process)
+	defer stop()
+
+	found := make(chan string, 2)
+	report := func(u string) {
+		select {
+		case found <- u:
+		default:
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go watchOutput(outR, os.Stdout, report, &wg)
+	go watchOutput(errR, os.Stderr, report, &wg)
+
+	exited := make(chan struct{})
+	timeout := time.Duration(l.cfg.Browser.Timeout) * time.Second
+	go func() {
+		select {
+		case <-exited:
+		case <-time.After(timeout):
+			ui.Warn("no local URL appeared in the output of %s within %s; set browser.url in the configuration", l.cfg.Name, ui.Duration(timeout))
+		case target := <-found:
+			if addr, err := hostPort(target); err == nil {
+				deadline := time.Now().Add(15 * time.Second)
+				for !portOpen(addr) && time.Now().Before(deadline) {
+					select {
+					case <-exited:
+						return
+					case <-time.After(200 * time.Millisecond):
+					}
+				}
+			}
+			ui.Step("%s is ready at %s", l.cfg.Name, target)
+			openBrowser(target)
+		}
+	}()
+	err := cmd.Wait()
+	outW.Close()
+	errW.Close()
+	wg.Wait()
+	close(exited)
+	return exitCode(err)
+}
+
 func openBrowser(u string) {
 	if !platform.HasDisplay() {
 		ui.Info("open %s in your browser", u)
@@ -217,7 +285,7 @@ func exitCode(err error) (int, error) {
 var varPattern = regexp.MustCompile(`\$\{([A-Za-z0-9_.]+)\}`)
 
 // expand replaces ${NAME} with launcher variables (APP_DIR, INSTALL_DIR,
-// DATA_DIR, HOME, VERSION, ID) or environment variables.
+// DATA_DIR, CWD, HOME, VERSION, ID) or environment variables.
 func expand(s string, vars map[string]string) string {
 	return varPattern.ReplaceAllStringFunc(s, func(m string) string {
 		name := m[2 : len(m)-1]

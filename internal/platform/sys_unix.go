@@ -21,3 +21,7 @@ func ProcessAlive(pid int) bool {
 	err = p.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
+
+// EnableANSI reports whether ANSI escape sequences can be used on f. Unix
+// terminals support them.
+func EnableANSI(*os.File) bool { return true }

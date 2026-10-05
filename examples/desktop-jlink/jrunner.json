@@ -1,0 +1,23 @@
+{
+  "name": "Photo Organizer",
+  "id": "photo-organizer",
+  "version": "2.1.0",
+  "publisher": "Example Software",
+  "jar": "target/photo-organizer-2.1.0.jar",
+  "files": ["target/lib", "assets/splash.png"],
+  "icons": ["assets/icon.ico", "assets/icon.icns", "assets/icon.png"],
+
+  "java": {
+    "runtime": "runtimes/{platform}",
+    "mainClass": "com.example.photo.Main",
+    "classPath": ["lib/*"],
+    "options": ["-Xmx2g", "-splash:${APP_DIR}/splash.png"]
+  },
+
+  "update": {
+    "url": "https://downloads.example.com/photo-organizer/update.json",
+    "auto": true
+  },
+
+  "install": { "desktopShortcut": true, "menuShortcut": true }
+}

@@ -42,12 +42,15 @@ func Init(jar string, force bool) error {
 		Java: config.Java{
 			MinVersion: info.java,
 			Options:    []string{"-Xmx512m"},
-			Download:   []config.Source{{Provider: "adoptium"}, {Provider: "zulu"}},
+			Download:   config.DefaultSources(),
 		},
 		Install: config.Install{DesktopShortcut: true, MenuShortcut: true},
 	}
-	if info.springBoot && info.port > 0 {
-		cfg.Browser = &config.Browser{URL: fmt.Sprintf("http://localhost:%d%s/", info.port, strings.TrimSuffix(info.contextPath, "/"))}
+	if info.springBoot {
+		cfg.Browser = &config.Browser{} // URL detected from the log at run time
+		if info.port > 0 {
+			cfg.Browser.URL = fmt.Sprintf("http://localhost:%d%s/", info.port, strings.TrimSuffix(info.contextPath, "/"))
+		}
 	}
 	data, err := cfg.Marshal()
 	if err != nil {
@@ -60,7 +63,11 @@ func Init(jar string, force bool) error {
 	ui.Info("jar:   %s", jar)
 	ui.Info("java:  %d+", cfg.Java.MinVersion)
 	if cfg.Browser != nil {
-		ui.Info("web:   Spring Boot app, opens %s", cfg.Browser.URL)
+		if cfg.Browser.URL != "" {
+			ui.Info("web:   Spring Boot app, opens %s", cfg.Browser.URL)
+		} else {
+			ui.Info("web:   Spring Boot app, the URL is detected from the log at start")
+		}
 	}
 	ui.Info("Review the file, then run: jrunner build --target all")
 	ui.Info("Updates: add \"update\": {\"url\": \"https://example.com/myapp/update.json\"}")

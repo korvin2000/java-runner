@@ -1,0 +1,17 @@
+{
+  "name": "Report Tool",
+  "id": "report-tool",
+  "version": "3.0.0",
+  "jar": "build/libs/report-tool-3.0.0-all.jar",
+  "workDir": "${CWD}",
+
+  "java": {
+    "minVersion": 11,
+    "maxVersion": 21,
+    "image": "jre",
+    "download": ["adoptium", "zulu", "corretto"],
+    "options": ["-Xmx1g", "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1"]
+  },
+
+  "install": { "addToPath": true }
+}

@@ -5,6 +5,7 @@ package fetch
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,7 +26,7 @@ import (
 // stallTimeout aborts a download that receives no data for this long.
 const stallTimeout = 60 * time.Second
 
-// ErrChecksum is returned when a downloaded file does not match its SHA-256.
+// ErrChecksum is returned when a downloaded file does not match its checksum.
 var ErrChecksum = errors.New("checksum mismatch")
 
 var client = &http.Client{Transport: &http.Transport{
@@ -86,9 +87,10 @@ func Text(ctx context.Context, url string) (string, error) {
 	return string(b), err
 }
 
-// File downloads url to dest with a progress bar. If wantSHA256 (hex) is not
-// empty the content is verified. Transient failures are retried once.
-func File(ctx context.Context, url, dest, wantSHA256 string) error {
+// File downloads url to dest with a progress bar. If want (a hex SHA-256 or,
+// for vendors that publish nothing better, SHA-1) is not empty the content is
+// verified. Transient failures are retried once.
+func File(ctx context.Context, url, dest, want string) error {
 	var err error
 	for attempt := 1; attempt <= 2; attempt++ {
 		if attempt > 1 {
@@ -99,7 +101,7 @@ func File(ctx context.Context, url, dest, wantSHA256 string) error {
 			case <-time.After(2 * time.Second):
 			}
 		}
-		err = download(ctx, url, dest, strings.TrimSpace(wantSHA256))
+		err = download(ctx, url, dest, strings.TrimSpace(want))
 		var se *statusError
 		if err == nil || errors.Is(err, ErrChecksum) || ctx.Err() != nil ||
 			(errors.As(err, &se) && se.status >= 400 && se.status < 500) {
@@ -128,6 +130,9 @@ func download(parent context.Context, url, dest, want string) error {
 	defer watchdog.Stop()
 
 	h := sha256.New()
+	if len(want) == 40 {
+		h = sha1.New()
+	}
 	bar := ui.NewBar(resp.ContentLength)
 	body := readerFunc(func(p []byte) (int, error) {
 		n, err := resp.Body.Read(p)

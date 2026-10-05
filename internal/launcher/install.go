@@ -56,31 +56,39 @@ func (l *launcher) install(p *pkg.Package, fromLauncher bool) error {
 	}
 	defer unlock()
 	ui.Info("location: %s", l.paths.Install)
+	stop := ui.Spin("copying application files")
 
 	tmp := l.paths.App + ".new"
 	_ = os.RemoveAll(tmp)
 	if err := p.Extract(pkg.AppDir, tmp); err != nil {
+		stop(false, "")
 		return fmt.Errorf("extracting application files: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(tmp, pkg.ConfigName), p.RawConfig, 0o644); err != nil {
+		stop(false, "")
 		return err
 	}
 	if err := fsutil.ReplaceDir(tmp, l.paths.App); err != nil {
+		stop(false, "")
 		os.RemoveAll(tmp)
 		return inUse(cfg.Name, err)
 	}
+	stop(true, fmt.Sprintf("application files (%s)", ui.Size(fsutil.DirSize(l.paths.App))))
 	if p.HasRuntime {
-		ui.Info("installing bundled Java runtime")
+		stop := ui.Spin("installing bundled Java runtime")
 		tmp := l.paths.Runtime + ".new"
 		_ = os.RemoveAll(tmp)
 		if err := p.Extract(pkg.RuntimeDir, tmp); err != nil {
+			stop(false, "")
 			return fmt.Errorf("extracting Java runtime: %w", err)
 		}
 		jre.FixPermissions(tmp)
 		if err := fsutil.ReplaceDir(tmp, l.paths.Runtime); err != nil {
+			stop(false, "")
 			os.RemoveAll(tmp)
 			return inUse(cfg.Name, err)
 		}
+		stop(true, fmt.Sprintf("bundled Java runtime (%s)", ui.Size(fsutil.DirSize(l.paths.Runtime))))
 	}
 	if fromLauncher && !samePath(l.exe, l.paths.Launcher) {
 		if err := l.writeLauncher(p); err != nil {
@@ -101,7 +109,7 @@ func (l *launcher) install(p *pkg.Package, fromLauncher bool) error {
 		return err
 	}
 	l.integrate(firstInstall)
-	ui.Info("installed %s %s", cfg.Name, cfg.Version)
+	ui.Success("installed %s %s", cfg.Name, cfg.Version)
 	return nil
 }
 

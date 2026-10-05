@@ -29,3 +29,24 @@ func ProcessAlive(pid int) bool {
 	_ = p.Release()
 	return true
 }
+
+var (
+	procGetConsoleMode = syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleMode")
+	procSetConsoleMode = syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleMode")
+)
+
+// EnableANSI turns on virtual terminal processing for the console behind f
+// (Windows 10 and later) and reports whether ANSI escapes can be used.
+func EnableANSI(f *os.File) bool {
+	const enableVirtualTerminalProcessing = 0x0004
+	h := f.Fd()
+	var mode uint32
+	if r, _, _ := procGetConsoleMode.Call(h, uintptr(unsafe.Pointer(&mode))); r == 0 {
+		return false
+	}
+	if mode&enableVirtualTerminalProcessing != 0 {
+		return true
+	}
+	r, _, _ := procSetConsoleMode.Call(h, uintptr(mode|enableVirtualTerminalProcessing))
+	return r != 0
+}
