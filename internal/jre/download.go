@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path"
@@ -26,9 +27,20 @@ type artifact struct {
 	note           string // e.g. "JDK, this vendor publishes no JRE"
 }
 
-// localError is a failure on this computer (e.g. files in use) that another
-// download source cannot fix.
+// localError is a failure on this computer (disk full, no permission, files
+// in use) that another download source cannot fix.
 type localError struct{ error }
+
+// isLocal reports file system errors. Starting a program that has the wrong
+// format is the download's fault, not being allowed to start it at all.
+func isLocal(err error) bool {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return !strings.Contains(pe.Op, "exec") || errors.Is(err, fs.ErrPermission)
+	}
+	var le *os.LinkError
+	return errors.As(err, &le)
+}
 
 // Download fetches Java feature release `feature` from the first source
 // that works, verifies and unpacks it into dir (replacing its content) and
@@ -63,13 +75,23 @@ func install(ctx context.Context, a *artifact, req Requirement, dir string) (*Ru
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return nil, localError{err}
 	}
+	// The archive is kept after a local failure, so that the next attempt can
+	// reuse it (verified by its checksum) instead of downloading it again.
 	file := dir + ".download"
-	defer os.Remove(file)
+	keep := false
+	defer func() {
+		if !keep {
+			os.Remove(file)
+		}
+	}()
 	ui.Info("downloading %s", a.name)
 	if a.note != "" {
 		ui.Info("%s", a.note)
 	}
 	if err := fetch.File(ctx, a.url, file, a.sum); err != nil {
+		if isLocal(err) {
+			return nil, localError{err}
+		}
 		return nil, err
 	}
 	if a.sum != "" {
@@ -92,11 +114,17 @@ func install(ctx context.Context, a *artifact, req Requirement, dir string) (*Ru
 			if why := req.Check(rt); why != "" {
 				err = fmt.Errorf("downloaded runtime is not usable: %s", why)
 			}
+		} else if errors.Is(err, fs.ErrPermission) {
+			err = fmt.Errorf("%w (is %s on a file system mounted noexec, or blocked by a security policy?)", err, filepath.Dir(dir))
 		}
 	}
 	stop(err == nil, "Java "+versionOf(rt)+" works")
 	if err != nil {
 		os.RemoveAll(tmp)
+		if isLocal(err) {
+			keep = a.sum != ""
+			return nil, localError{err}
+		}
 		return nil, err
 	}
 	rel, _ := filepath.Rel(tmp, home)

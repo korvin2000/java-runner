@@ -32,6 +32,21 @@ type Runtime struct {
 // Java returns the path of the java executable.
 func (r *Runtime) Java() string { return filepath.Join(r.Home, "bin", exe("java")) }
 
+// Intact reports whether the runtime's key files are present: java and the
+// class library (lib/modules, or rt.jar for Java 8). This cheap check catches
+// a private runtime that was damaged after installation.
+func Intact(r *Runtime) bool {
+	if !fsutil.IsFile(r.Java()) {
+		return false
+	}
+	for _, f := range []string{"lib/modules", "lib/rt.jar", "jre/lib/rt.jar"} {
+		if fsutil.IsFile(filepath.Join(r.Home, filepath.FromSlash(f))) {
+			return true
+		}
+	}
+	return false
+}
+
 // Feature returns the feature release, e.g. 17.
 func (r *Runtime) Feature() int { return version.JavaFeature(r.Version) }
 
@@ -116,7 +131,10 @@ func Find(req Requirement, preferred ...string) *Runtime {
 	}
 	for _, h := range preferred {
 		if r := try(h, "private"); r != nil {
-			return r
+			if Intact(r) {
+				return r
+			}
+			ui.Debug("skipping %s: damaged (class library missing)", r)
 		}
 	}
 	if r := try(os.Getenv("JAVA_HOME"), "system"); r != nil {
@@ -178,13 +196,15 @@ func ProbeExec(home string) (*Runtime, error) {
 // probeJava runs a java executable and reads version, vendor, architecture
 // and home from its system properties.
 func probeJava(java string) (*Runtime, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Generous: the first start of a new runtime may be slowed down by a
+	// virus scanner checking every file.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, java, "-XshowSettings:properties", "-version")
 	cmd.Env = append(os.Environ(), "JAVA_TOOL_OPTIONS=", "_JAVA_OPTIONS=") // keep the output clean
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("%s does not run: %v %s", java, err, firstLine(out))
+		return nil, fmt.Errorf("%s does not run: %w %s", java, err, firstLine(out))
 	}
 	r := &Runtime{}
 	sc := bufio.NewScanner(bytes.NewReader(out))

@@ -21,8 +21,9 @@ import (
 const updateFile = ".update.zip"
 
 func (l *launcher) updateDue() bool {
-	u := l.cfg.Update
-	return u != nil && time.Since(l.state.LastUpdateCheck) >= u.Interval()
+	u, last := l.cfg.Update, l.state.LastUpdateCheck
+	// A last check in the future means the clock was wrong: check now.
+	return u != nil && (last.After(time.Now()) || time.Since(last) >= u.Interval())
 }
 
 // checkUpdate fetches update.json and, if a newer version is published and
@@ -61,22 +62,67 @@ func (l *launcher) checkUpdate(forced bool) (bool, error) {
 		ui.Info("not installed; run \"%s %supdate\" to install it later", l.paths.Launcher, flagPrefix)
 		return false, nil
 	}
-	p, done, err := l.downloadPackage(m)
+	unlock, err := lock(l.paths.Install)
 	if err != nil {
 		return false, err
 	}
-	defer done()
+	defer unlock()
+	// Another launcher may have installed this update while this one waited.
+	if inst := loadInstalledConfig(l.paths.App); inst != nil &&
+		version.Compare(inst.Version, l.cfg.Version) > 0 && version.Compare(inst.Version, m.Version) >= 0 {
+		ui.Success("%s %s was installed by another instance", inst.Name, inst.Version)
+		l.cfg, l.state = inst, loadState(l.paths.State)
+		return true, nil
+	}
+	p, file, err := l.downloadPackage(m)
+	if err != nil {
+		return false, err
+	}
+	// The verified package is kept when it cannot be installed right now
+	// (files in use, Java not available offline): the next attempt reuses it.
+	keep := false
+	defer func() {
+		p.Close()
+		if !keep {
+			os.Remove(file)
+		}
+	}()
 	switch {
 	case version.Compare(p.Config.Version, m.Version) != 0:
 		return false, fmt.Errorf("update package contains version %s, but update.json announces %s", p.Config.Version, m.Version)
 	case p.Config.Build != nil && p.Config.Build.BundledRuntime != p.HasRuntime:
 		return false, errors.New("update package is inconsistent (bundled runtime)")
 	}
+	if err := l.prepareJava(p); err != nil {
+		keep = true
+		return false, fmt.Errorf("%s %s needs Java %s: %w; %s stays installed", p.Config.Name, p.Config.Version, requirement(p.Config), err, l.cfg.Version)
+	}
 	ui.Step("Installing %s %s", p.Config.Name, p.Config.Version)
-	if err := l.install(p, false); err != nil {
+	if err := l.installLocked(p, false); err != nil {
+		keep = true
 		return false, err
 	}
 	return true, nil
+}
+
+// prepareJava makes sure that the Java an update requires is available
+// before the update replaces the installed version, so that a failing
+// download (e.g. offline) leaves the current version usable. The caller holds
+// the install lock.
+func (l *launcher) prepareJava(p *pkg.Package) error {
+	if p.HasRuntime || l.override != nil {
+		return nil // brings its own runtime, or the user chose one
+	}
+	req := requirement(p.Config)
+	if usable(l.state.Java, req) {
+		return nil
+	}
+	rt, err := l.resolveJava(p.Config, req)
+	if err != nil {
+		return err
+	}
+	l.state.Java = rt
+	return nil
 }
 
 // fetchManifest downloads and validates update.json.
@@ -93,47 +139,48 @@ func (l *launcher) fetchManifest(timeout time.Duration) (*pkg.Manifest, error) {
 	return &m, nil
 }
 
-// downloadPackage fetches the package announced by m for this platform,
-// verifies it and opens it. done removes the temporary file.
-func (l *launcher) downloadPackage(m *pkg.Manifest) (p *pkg.Package, done func(), err error) {
+// downloadPackage fetches the package announced by m for this platform
+// (resuming an interrupted download, reusing a complete one), verifies it
+// and opens it. The caller closes p and decides whether to remove file.
+func (l *launcher) downloadPackage(m *pkg.Manifest) (p *pkg.Package, file string, err error) {
 	asset := pkg.Asset{URL: m.URL, SHA256: m.SHA256}
 	if a, ok := m.Platforms[platform.Key()]; ok {
 		asset = a
 	}
 	if asset.URL == "" {
-		return nil, nil, fmt.Errorf("version %s has no package for %s", m.Version, platform.Key())
+		return nil, "", fmt.Errorf("version %s has no package for %s", m.Version, platform.Key())
 	}
 	pkgURL, err := resolveRef(l.cfg.Update.URL, asset.URL)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
 	if asset.SHA256 == "" {
 		ui.Warn("update.json has no sha256 for the package, integrity not verified")
 	}
-	file := filepath.Join(l.paths.Install, updateFile)
+	file = filepath.Join(l.paths.Install, updateFile)
 	if err := os.MkdirAll(l.paths.Install, 0o755); err != nil {
-		return nil, nil, err
+		return nil, "", err
 	}
 	ui.Info("downloading %s", pkgURL)
 	if err := fetch.File(context.Background(), pkgURL, file, asset.SHA256); err != nil {
-		os.Remove(file)
-		return nil, nil, err
+		return nil, "", err // a partial download stays for the next attempt
 	}
-	p, err = pkg.OpenFile(file)
-	if err != nil {
+	if p, err = pkg.OpenFile(file); err != nil {
 		os.Remove(file)
-		return nil, nil, err
+		return nil, "", err
 	}
-	done = func() { p.Close(); os.Remove(file) }
 	switch {
 	case p.Config.ID != l.cfg.ID:
-		done()
-		return nil, nil, fmt.Errorf("package is for %q, not %q", p.Config.ID, l.cfg.ID)
+		err = fmt.Errorf("package is for %q, not %q", p.Config.ID, l.cfg.ID)
 	case !p.HasApp:
-		done()
-		return nil, nil, errors.New("package contains no application files")
+		err = errors.New("package contains no application files")
 	}
-	return p, done, nil
+	if err != nil {
+		p.Close()
+		os.Remove(file)
+		return nil, "", err
+	}
+	return p, file, nil
 }
 
 // bootstrap installs a thin launcher: the application package is downloaded
@@ -145,19 +192,34 @@ func (l *launcher) bootstrap() error {
 		return fmt.Errorf("cannot reach the download server: %w", err)
 	}
 	ui.Info("latest version: %s", m.Version)
-	p, done, err := l.downloadPackage(m)
+	unlock, err := lock(l.paths.Install)
 	if err != nil {
 		return err
 	}
-	defer done()
+	defer unlock()
+	if l.installedMeanwhile(nil) {
+		return nil
+	}
+	p, file, err := l.downloadPackage(m)
+	if err != nil {
+		return err
+	}
+	keep := true // kept for a retry unless installed
+	defer func() {
+		p.Close()
+		if !keep {
+			os.Remove(file)
+		}
+	}()
 	if !samePath(l.exe, l.paths.Launcher) {
-		if err := fsutil.CopyFile(l.exe, l.paths.Launcher, 0o755); err != nil {
+		if err := fsutil.CopyFileAtomic(l.exe, l.paths.Launcher, 0o755); err != nil {
 			return fmt.Errorf("installing launcher: %w", err)
 		}
 	}
-	if err := l.install(p, false); err != nil {
+	if err := l.installLocked(p, false); err != nil {
 		return err
 	}
+	keep = false
 	l.state.LastUpdateCheck = time.Now()
 	return l.state.save(l.paths.State)
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/korvin2000/java-runner/internal/config"
 	"github.com/korvin2000/java-runner/internal/fsutil"
 	"github.com/korvin2000/java-runner/internal/jre"
 	"github.com/korvin2000/java-runner/internal/pkg"
@@ -45,16 +46,49 @@ func (s *state) save(name string) error {
 	return fsutil.WriteFileAtomic(name, data, 0o644)
 }
 
-// install copies a package into the install directory. fromLauncher is true
-// for the package embedded in this executable: then the launcher binary is
-// installed too. Update packages only replace the application files.
-func (l *launcher) install(p *pkg.Package, fromLauncher bool) error {
-	cfg := p.Config
+// install installs the package embedded in this executable (including the
+// launcher binary) under the install lock.
+func (l *launcher) install(p *pkg.Package) error {
 	unlock, err := lock(l.paths.Install)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	if l.installedMeanwhile(p.Config) {
+		return nil
+	}
+	return l.installLocked(p, true)
+}
+
+// installedMeanwhile reports whether another launcher completed an
+// installation of want (nil: of any version) while this one waited for the
+// lock, e.g. after a double-click on the first start, and adopts it instead
+// of installing again (which on Windows would fail on the running app).
+func (l *launcher) installedMeanwhile(want *config.Config) bool {
+	if l.opts.reinstall {
+		return false
+	}
+	st := loadState(l.paths.State)
+	inst := loadInstalledConfig(l.paths.App)
+	switch {
+	case inst == nil || st.Version == "":
+		return false
+	case inst.Jar != "" && !fsutil.IsFile(filepath.Join(l.paths.App, filepath.FromSlash(inst.Jar))):
+		return false
+	case want != nil && (st.Version != want.Version || st.Build != buildID(want)):
+		return false
+	}
+	ui.Success("installed by another instance")
+	l.state, l.cfg = st, inst
+	return true
+}
+
+// installLocked copies a package into the install directory; the caller
+// holds the install lock. fromLauncher is true for the package embedded in
+// this executable: then the launcher binary is installed too. Update packages
+// only replace the application files.
+func (l *launcher) installLocked(p *pkg.Package, fromLauncher bool) error {
+	cfg := p.Config
 	ui.Info("location: %s", l.paths.Install)
 	stop := ui.Spin("copying application files")
 

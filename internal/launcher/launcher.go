@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/korvin2000/java-runner/internal/config"
@@ -105,6 +106,7 @@ func (l *launcher) run(appArgs []string) (int, error) {
 	if l.opts.uninstall {
 		return 0, l.uninstall()
 	}
+	l.recoverInterrupted()
 	l.state = loadState(l.paths.State)
 	installed := loadInstalledConfig(l.paths.App)
 	if l.opts.info {
@@ -119,7 +121,7 @@ func (l *launcher) run(appArgs []string) (int, error) {
 			l.state.Java = nil // look for Java again
 		}
 		if l.embedded.HasApp {
-			if err := l.install(l.embedded, true); err != nil {
+			if err := l.install(l.embedded); err != nil {
 				return 1, err
 			}
 		} else {
@@ -190,8 +192,8 @@ func (l *launcher) installReason(installed *config.Config) string {
 }
 
 // ensureJava makes sure state.Java points to a usable runtime. The common
-// case costs one stat call. <ID>_JAVA_HOME overrides discovery for this
-// launch without being remembered.
+// case costs one or two stat calls. <ID>_JAVA_HOME overrides discovery for
+// this launch without being remembered.
 func (l *launcher) ensureJava() error {
 	req := requirement(l.cfg)
 	if home := os.Getenv(envJavaHomeName(l.cfg.ID)); home != "" {
@@ -207,22 +209,48 @@ func (l *launcher) ensureJava() error {
 		l.override = rt
 		return nil
 	}
-	// "override" entries were saved by older versions and are not trusted.
-	if rt := l.state.Java; rt != nil && rt.Source != "override" && fsutil.IsFile(rt.Java()) && req.Accepts(rt) {
+	if usable(l.state.Java, req) {
 		return nil
 	}
 	unlock, err := lock(l.paths.Install)
 	if err != nil {
-		return err
+		if !fsutil.NotWritable(err) {
+			return err
+		}
+		// A read-only installation (e.g. deployed by an administrator):
+		// discovery still works, only a download would fail.
+		ui.Debug("no install lock: %v", err)
+		unlock = func() {}
 	}
 	defer unlock()
-	rt, err := l.resolveJava(req)
+	// Another launcher may have resolved Java while this one waited.
+	if st := loadState(l.paths.State); usable(st.Java, req) {
+		l.state.Java = st.Java
+		return nil
+	}
+	rt, err := l.resolveJava(l.cfg, req)
 	if err != nil {
 		return err
 	}
 	l.setup = true
 	l.state.Java = rt
-	return l.state.save(l.paths.State)
+	if err := l.state.save(l.paths.State); err != nil {
+		ui.Warn("cannot save %s (%v); Java will be searched again next time", l.paths.State, err)
+	}
+	return nil
+}
+
+// usable reports whether a remembered runtime can still be used: it exists,
+// is not damaged (own runtimes) and satisfies req. "override" entries were
+// saved by older versions and are not trusted.
+func usable(rt *jre.Runtime, req jre.Requirement) bool {
+	switch {
+	case rt == nil || rt.Source == "override":
+		return false
+	case rt.Source == "system":
+		return fsutil.IsFile(rt.Java()) && req.Accepts(rt)
+	}
+	return jre.Intact(rt) && req.Accepts(rt)
 }
 
 // javaRuntime is the runtime used for this launch.
@@ -233,9 +261,14 @@ func (l *launcher) javaRuntime() *jre.Runtime {
 	return l.state.Java
 }
 
-func (l *launcher) resolveJava(req jre.Requirement) (*jre.Runtime, error) {
-	if l.cfg.Build != nil && l.cfg.Build.BundledRuntime {
+// resolveJava finds or downloads a runtime for cfg; the caller holds the
+// install lock.
+func (l *launcher) resolveJava(cfg *config.Config, req jre.Requirement) (*jre.Runtime, error) {
+	if cfg.Build != nil && cfg.Build.BundledRuntime {
 		rt, err := jre.Probe(l.paths.Runtime)
+		if err == nil && !jre.Intact(rt) {
+			err = errors.New("class library missing")
+		}
 		if err != nil {
 			return nil, fmt.Errorf("bundled Java runtime is missing or damaged (%v); run with %sreinstall", err, flagPrefix)
 		}
@@ -251,13 +284,13 @@ func (l *launcher) resolveJava(req jre.Requirement) (*jre.Runtime, error) {
 		ui.Success("using %s", rt)
 		return rt, nil
 	}
-	feature := l.cfg.DownloadFeature()
+	feature := cfg.DownloadFeature()
 	if !req.AcceptsFeature(feature) {
 		feature = req.Min
 	}
 	ui.Info("no suitable Java installation found on this computer")
-	ui.Step("Downloading Java %d (%s, %s)", feature, l.cfg.Java.Image, platform.Key())
-	rt, err := jre.Download(context.Background(), l.cfg.Java.Download, feature, req, l.paths.Runtime)
+	ui.Step("Downloading Java %d (%s, %s)", feature, cfg.Java.Image, platform.Key())
+	rt, err := jre.Download(context.Background(), cfg.Java.Download, feature, req, l.paths.Runtime)
 	if err != nil {
 		return nil, err
 	}
@@ -269,23 +302,57 @@ func requirement(c *config.Config) jre.Requirement {
 	return jre.Requirement{Min: c.Java.MinVersion, Max: c.Java.MaxVersion, JDK: c.Java.Image == "jdk"}
 }
 
+// keepDownloads is how long partial (or complete but not yet installed)
+// downloads are kept so that a later launch can resume or reuse them.
+const keepDownloads = 72 * time.Hour
+
+// lockFile is the install lock; see lock.
+func (l *launcher) lockFile() string { return filepath.Join(l.paths.Install, ".lock") }
+
+// recoverInterrupted moves a directory back whose replacement was
+// interrupted between its two renames (only the ".old" copy exists), so that
+// a crash or power loss at that moment does not force a reinstallation.
+func (l *launcher) recoverInterrupted() {
+	if _, held := lockHolder(l.lockFile()); held {
+		return
+	}
+	for _, d := range []string{l.paths.App, l.paths.Runtime} {
+		if !fsutil.Exists(d) && fsutil.IsDir(d+".old") {
+			ui.Debug("restoring %s from an interrupted update", d)
+			_ = fsutil.Rename(d+".old", d)
+		}
+	}
+}
+
 // cleanup removes leftovers of replaced files (Windows keeps running
-// executables and open jars locked until the process exits) and of
-// interrupted downloads. It is skipped while another launcher holds the
-// install lock: the leftovers may be its work in progress.
+// executables and open jars locked until the process exits), of interrupted
+// extractions and of downloads older than keepDownloads. It is skipped while
+// another launcher holds the install lock: the leftovers may be its work in
+// progress.
 func (l *launcher) cleanup() {
-	if _, held := lockHolder(filepath.Join(l.paths.Install, ".lock")); held {
+	if _, held := lockHolder(l.lockFile()); held {
 		return
 	}
 	for _, p := range []string{
-		l.paths.Launcher + ".old", l.paths.App + ".old", l.paths.App + ".new",
-		l.paths.Runtime + ".old", l.paths.Runtime + ".new", l.paths.Runtime + ".download", l.paths.Runtime + ".download.part",
-		filepath.Join(l.paths.Install, updateFile), filepath.Join(l.paths.Install, updateFile+".part"),
+		l.paths.Launcher + ".old", l.paths.Launcher + ".tmp", l.paths.App + ".old", l.paths.App + ".new",
+		l.paths.Runtime + ".old", l.paths.Runtime + ".new",
 	} {
 		if fsutil.Exists(p) {
 			_ = os.RemoveAll(p)
 		}
 	}
+	removeOlder := func(age time.Duration, files ...string) {
+		for _, p := range files {
+			if st, err := os.Lstat(p); err == nil && time.Since(st.ModTime()) > age {
+				_ = os.Remove(p)
+			}
+		}
+	}
+	for _, f := range []string{l.paths.Runtime + ".download", filepath.Join(l.paths.Install, updateFile)} {
+		removeOlder(keepDownloads, f, f+".part", f+".part.meta")
+	}
+	tmps, _ := filepath.Glob(l.paths.State + ".*.tmp") // from an interrupted state save
+	removeOlder(time.Minute, tmps...)
 }
 
 func buildID(c *config.Config) string {
@@ -352,23 +419,50 @@ func loadInstalledConfig(appDir string) *config.Config {
 	return c
 }
 
-// lock serializes installation and runtime downloads between concurrently
-// started launchers. Locks of dead processes are taken over.
+const (
+	lockRefresh = 10 * time.Second // the holder touches the lock file this often
+	lockStale   = time.Minute      // a lock not touched for this long is abandoned
+)
+
+// lock serializes installation, updates and runtime downloads between
+// concurrently started launchers. The holder keeps the lock file fresh, so
+// a waiting launcher waits as long as needed (a slow download may take many
+// minutes) and takes over the lock of a crashed or hung process.
 func lock(dir string) (func(), error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create %s: %w", dir, err)
 	}
 	name := filepath.Join(dir, ".lock")
-	deadline := time.Now().Add(5 * time.Minute)
-	waiting := false
+	waiting, denied := false, 0
 	for {
 		f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err == nil {
 			fmt.Fprint(f, os.Getpid())
 			f.Close()
-			return func() { os.Remove(name) }, nil
+			stop := make(chan struct{})
+			go func() {
+				t := time.NewTicker(lockRefresh)
+				defer t.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case now := <-t.C:
+						_ = os.Chtimes(name, now, now)
+					}
+				}
+			}()
+			var once sync.Once
+			return func() { once.Do(func() { close(stop); os.Remove(name) }) }, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
+			// Windows denies access to a file whose deletion is pending
+			// (the previous holder just released it): try again shortly.
+			if runtime.GOOS == "windows" && errors.Is(err, os.ErrPermission) && fsutil.Exists(name) && denied < 20 {
+				denied++
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 			return nil, err
 		}
 		pid, held := lockHolder(name)
@@ -376,29 +470,32 @@ func lock(dir string) (func(), error) {
 			os.Remove(name)
 			continue
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("another installation (process %d) is still running; remove %s if that is not the case", pid, name)
-		}
 		if !waiting {
-			ui.Info("waiting for another instance to finish installing...")
+			ui.Info("waiting for another instance (process %d) to finish installing...", pid)
 			waiting = true
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-// lockHolder reads the lock file name and reports the owning process and
-// whether it is another live process. A lock without a pid is still being
-// written by its owner unless it is older than a few seconds.
+// lockHolder reports the process owning the lock file name and whether the
+// lock is held by another live process. A lock that has not been refreshed
+// for lockStale is abandoned; one without a pid is still being written by
+// its owner unless it is older than a few seconds.
 func lockHolder(name string) (pid int, held bool) {
-	data, err := os.ReadFile(name)
+	st, err := os.Stat(name)
 	if err != nil {
 		return 0, false
 	}
-	fmt.Sscan(string(data), &pid)
+	age := time.Since(st.ModTime())
+	if age > lockStale {
+		return 0, false
+	}
+	if data, err := os.ReadFile(name); err == nil {
+		fmt.Sscan(string(data), &pid)
+	}
 	if pid <= 0 {
-		st, err := os.Stat(name)
-		return 0, err == nil && time.Since(st.ModTime()) < 10*time.Second
+		return 0, age < 10*time.Second
 	}
 	return pid, pid != os.Getpid() && platform.ProcessAlive(pid)
 }

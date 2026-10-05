@@ -167,6 +167,15 @@ is the reference build most distributions ship. The downloaded runtime is
 unpacked into `<install dir>/runtime`, test-run and remembered in `state.json`;
 it is downloaded once.
 
+Downloads (runtimes, update packages, thin-launcher installs) survive bad
+connections: failed transfers are retried with backoff, an interrupted
+download is resumed where it stopped (also by the next start, for up to three
+days), a corrupted one (checksum mismatch) is downloaded again, and a complete
+download that could not be installed (disk full, files in use) is reused. A
+private runtime that was damaged later is detected and replaced. Problems on
+this computer (no write permission, disk full, a `noexec` mount) are reported
+directly instead of trying every other source.
+
 ## Web applications and the browser
 
 With `"browser": {"url": "http://localhost:8080/"}` the launcher starts the
@@ -295,4 +304,6 @@ Requires Go 1.22+.
   file keeps the default icon.
 * **Update integrity.** Update packages are verified by SHA-256 from
   `update.json`. Serve both over HTTPS. There is no signature verification.
-* **Proxies.** Downloads honour `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`.
+* **Proxies.** Downloads honour `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`. If
+  none is set, the system proxy is used (Windows Internet Options, macOS
+  network settings); automatic configuration scripts (PAC) are not supported.

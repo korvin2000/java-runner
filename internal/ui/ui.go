@@ -238,15 +238,16 @@ func Spin(format string, a ...any) func(ok bool, result string) {
 // through io.MultiWriter. On a terminal it redraws one line; otherwise it
 // prints a line every 25%.
 type Bar struct {
-	total, done int64
-	start, last time.Time
-	lastPct     int64
+	total, done, base int64 // base: bytes already present (resumed download)
+	start, last       time.Time
+	lastPct           int64
 }
 
-// NewBar creates a progress bar; total may be -1 if unknown.
-func NewBar(total int64) *Bar {
+// NewBar creates a progress bar; total may be -1 if unknown, done is the
+// number of bytes already downloaded earlier.
+func NewBar(total, done int64) *Bar {
 	now := time.Now()
-	return &Bar{total: total, start: now, last: now}
+	return &Bar{total: total, done: done, base: done, start: now, last: now}
 }
 
 func (b *Bar) Write(p []byte) (int, error) {
@@ -282,7 +283,7 @@ func (b *Bar) render(final bool) {
 	if elapsed < 0.001 {
 		elapsed = 0.001
 	}
-	rate := float64(b.done) / elapsed
+	rate := float64(b.done-b.base) / elapsed
 	speed := Size(int64(rate)) + "/s"
 	if !ansi {
 		if b.total > 0 {
