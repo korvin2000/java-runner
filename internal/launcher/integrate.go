@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/korvin2000/java-runner/internal/fsutil"
+	"github.com/korvin2000/java-runner/internal/platform"
 	"github.com/korvin2000/java-runner/internal/ui"
 )
 
@@ -16,6 +17,15 @@ type integration struct {
 	Name, ID, Version, Publisher string
 	Launcher, InstallDir, Icon   string
 	Desktop, Menu, Path          bool
+}
+
+// fileName is the base name for shortcuts: the display name without
+// characters that are not allowed in file names.
+func (in integration) fileName() string {
+	if n := platform.SafeName(in.Name); n != "" {
+		return n
+	}
+	return in.ID
 }
 
 // integration describes the current app. Shortcuts and PATH entries are only
@@ -62,8 +72,11 @@ func (l *launcher) integrate(withShortcuts bool) {
 
 func (l *launcher) uninstall() error {
 	st := loadState(l.paths.State)
-	if st.Version == "" && !fsutil.Exists(l.paths.Install) {
+	if !fsutil.Exists(l.paths.State) && !fsutil.Exists(l.paths.App) {
 		return fmt.Errorf("%s is not installed (%s)", l.cfg.Name, l.paths.Install)
+	}
+	if sharedDir(l.paths.Install) {
+		return fmt.Errorf("refusing to delete %s: it is not a directory of its own (check install.dir); remove the application files manually", l.paths.Install)
 	}
 	if ui.Interactive() && !ui.Confirm("Uninstall "+l.cfg.Name+" from "+l.paths.Install+"?", false) {
 		ui.Info("cancelled")
@@ -84,6 +97,27 @@ func (l *launcher) uninstall() error {
 		ui.Info("your data in %s was kept", l.paths.Data)
 	}
 	return nil
+}
+
+// sharedDir reports whether dir is the home directory, contains it, or is one
+// of the per-user program or data folders: a misconfigured install.dir must
+// never make uninstall delete those.
+func sharedDir(dir string) bool {
+	dir = filepath.Clean(dir)
+	if filepath.Dir(dir) == dir {
+		return true // file system root
+	}
+	if home, err := os.UserHomeDir(); err == nil && filepath.Dir(home) != home {
+		if rel, err := filepath.Rel(dir, home); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	for _, f := range []func() (string, error){platform.ProgramsDir, platform.DataDir} {
+		if d, err := f(); err == nil && filepath.Clean(d) == dir {
+			return true
+		}
+	}
+	return false
 }
 
 // removeFiles deletes recorded shortcut files and links.

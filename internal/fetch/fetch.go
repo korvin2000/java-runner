@@ -142,7 +142,7 @@ func download(parent context.Context, url, dest, want string) error {
 		return n, err
 	})
 	_, err = io.Copy(io.MultiWriter(f, h, bar), body)
-	bar.Finish()
+	bar.Finish(err == nil)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

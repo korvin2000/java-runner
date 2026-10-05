@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/korvin2000/java-runner/internal/fsutil"
-	"github.com/korvin2000/java-runner/internal/platform"
 	"github.com/korvin2000/java-runner/internal/ui"
 )
 
@@ -24,7 +23,7 @@ func createIntegrations(in integration) ([]string, error) {
 	}
 	var created []string
 	var errs []error
-	name := platform.SafeName(in.Name)
+	name := in.fileName()
 	if in.Menu {
 		app := filepath.Join(home, "Applications", name+".app")
 		if err := writeAppBundle(app, in); err != nil {

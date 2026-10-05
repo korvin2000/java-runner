@@ -253,7 +253,8 @@ func FixPermissions(home string) {
 		files = append(files, filepath.Join(home, "lib", name))
 	}
 	for _, f := range files {
-		if st, err := os.Stat(f); err == nil && st.Mode().IsRegular() {
+		// Lstat: never follow a link, whatever it points to.
+		if st, err := os.Lstat(f); err == nil && st.Mode().IsRegular() {
 			_ = os.Chmod(f, st.Mode().Perm()|0o755)
 		}
 	}

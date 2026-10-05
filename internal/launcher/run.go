@@ -10,8 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/korvin2000/java-runner/internal/fsutil"
@@ -99,14 +101,45 @@ func (l *launcher) command(appArgs []string) (*exec.Cmd, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("cannot create working directory: %w", err)
 	}
-	cmd := exec.Command(l.state.Java.Java(), args...)
+	cmd := exec.Command(l.javaRuntime().Java(), args...)
 	cmd.Dir = dir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = os.Environ()
 	for k, v := range c.Java.Env {
-		cmd.Env = append(cmd.Env, k+"="+expand(v, vars))
+		cmd.Env = setEnv(cmd.Env, k, expand(v, vars))
 	}
 	return cmd, nil
+}
+
+// setEnv sets key in env, replacing an inherited value. Duplicates must be
+// avoided: the JVM uses the first occurrence, so an appended value would lose
+// against the inherited one when Java is exec'ed directly.
+func setEnv(env []string, key, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !envKeyIs(kv, key) {
+			out = append(out, kv)
+		}
+	}
+	return append(out, key+"="+value)
+}
+
+// hasEnv reports whether env contains key.
+func hasEnv(env []string, key string) bool {
+	for _, kv := range env {
+		if envKeyIs(kv, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func envKeyIs(kv, key string) bool {
+	k, _, _ := strings.Cut(kv, "=")
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(k, key)
+	}
+	return k == key
 }
 
 // vmOptionsFile is a user-editable file with one JVM option per line, kept
@@ -123,7 +156,8 @@ func readVMOptions(name string) []string {
 		return nil
 	}
 	var opts []string
-	for _, line := range strings.Split(string(data), "\n") {
+	text := strings.TrimPrefix(string(data), "\ufeff") // byte order mark written by some Windows editors
+	for _, line := range strings.Split(text, "\n") {
 		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
 			opts = append(opts, line)
 		}
@@ -149,22 +183,28 @@ func (l *launcher) launchWeb(cmd *exec.Cmd) (int, error) {
 	stop := handleSignals(cmd.Process)
 	defer stop()
 
+	// Large applications (e.g. Spring Boot with many beans) may need minutes:
+	// keep polling as long as the JVM runs; the timeout only adds a hint.
 	exited := make(chan struct{})
 	go func() {
-		deadline := time.Now().Add(time.Duration(l.cfg.Browser.Timeout) * time.Second)
-		for time.Now().Before(deadline) {
+		timeout := time.Duration(l.cfg.Browser.Timeout) * time.Second
+		start, interval, hinted := time.Now(), 300*time.Millisecond, false
+		for {
 			select {
 			case <-exited:
 				return
-			case <-time.After(300 * time.Millisecond):
+			case <-time.After(interval):
 			}
 			if portOpen(addr) {
 				ui.Step("%s is ready at %s", l.cfg.Name, target)
 				openBrowser(target)
 				return
 			}
+			if !hinted && time.Since(start) >= timeout {
+				hinted, interval = true, time.Second
+				ui.Info("%s is still starting (port %s not open after %s); the browser opens as soon as it is ready", l.cfg.Name, addr, ui.Duration(timeout))
+			}
 		}
-		ui.Warn("%s did not open port %s within %ds; open %s manually once it is ready", l.cfg.Name, addr, l.cfg.Browser.Timeout, target)
 	}()
 	err = cmd.Wait()
 	close(exited)
@@ -180,7 +220,7 @@ func (l *launcher) launchWebDetect(cmd *exec.Cmd) (int, error) {
 	cmd.Stdout, cmd.Stderr = outW, errW
 	// The app writes to a pipe now and would turn its log colors off; tell
 	// Spring Boot that the output still ends up on a color terminal.
-	if ui.Colors() && platform.IsTerminal(os.Stdout) && os.Getenv("SPRING_OUTPUT_ANSI_ENABLED") == "" {
+	if ui.Colors() && platform.IsTerminal(os.Stdout) && !hasEnv(cmd.Env, "SPRING_OUTPUT_ANSI_ENABLED") {
 		cmd.Env = append(cmd.Env, "SPRING_OUTPUT_ANSI_ENABLED=ALWAYS")
 	}
 	if err := cmd.Start(); err != nil {
@@ -196,31 +236,46 @@ func (l *launcher) launchWebDetect(cmd *exec.Cmd) (int, error) {
 		default:
 		}
 	}
+	var lastOutput atomic.Int64 // UnixNano of the latest output: the app is making progress
+	lastOutput.Store(time.Now().UnixNano())
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go watchOutput(outR, os.Stdout, report, &wg)
-	go watchOutput(errR, os.Stderr, report, &wg)
+	go watchOutput(outR, os.Stdout, report, &lastOutput, &wg)
+	go watchOutput(errR, os.Stderr, report, &lastOutput, &wg)
 
+	// The URL usually appears at the very end of the startup log, which can
+	// take minutes. Wait as long as the JVM runs; the timeout counts from the
+	// latest output line and only adds a hint, a URL seen later still counts.
 	exited := make(chan struct{})
 	timeout := time.Duration(l.cfg.Browser.Timeout) * time.Second
 	go func() {
-		select {
-		case <-exited:
-		case <-time.After(timeout):
-			ui.Warn("no local URL appeared in the output of %s within %s; set browser.url in the configuration", l.cfg.Name, ui.Duration(timeout))
-		case target := <-found:
-			if addr, err := hostPort(target); err == nil {
-				deadline := time.Now().Add(15 * time.Second)
-				for !portOpen(addr) && time.Now().Before(deadline) {
-					select {
-					case <-exited:
-						return
-					case <-time.After(200 * time.Millisecond):
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		hinted := false
+		for {
+			select {
+			case <-exited:
+				return
+			case <-tick.C:
+				if !hinted && time.Since(time.Unix(0, lastOutput.Load())) >= timeout {
+					hinted = true
+					ui.Warn("no local URL in the output of %s yet (no output for %s); if it does not announce one, set browser.url in the configuration", l.cfg.Name, ui.Duration(timeout))
+				}
+			case target := <-found:
+				if addr, err := hostPort(target); err == nil {
+					deadline := time.Now().Add(15 * time.Second)
+					for !portOpen(addr) && time.Now().Before(deadline) {
+						select {
+						case <-exited:
+							return
+						case <-time.After(200 * time.Millisecond):
+						}
 					}
 				}
+				ui.Step("%s is ready at %s", l.cfg.Name, target)
+				openBrowser(target)
+				return
 			}
-			ui.Step("%s is ready at %s", l.cfg.Name, target)
-			openBrowser(target)
 		}
 	}()
 	err := cmd.Wait()

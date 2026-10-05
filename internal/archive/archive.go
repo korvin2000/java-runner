@@ -56,6 +56,7 @@ func Extract(src, dest string) error {
 // ExtractZip extracts the entries of zr whose names start with prefix into
 // dest, with the prefix removed.
 func ExtractZip(zr *zip.Reader, prefix, dest string) error {
+	dest = filepath.Clean(dest)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
@@ -65,6 +66,9 @@ func ExtractZip(zr *zip.Reader, prefix, dest string) error {
 			continue
 		}
 		target, err := safeJoin(dest, rel)
+		if err == nil {
+			err = checkNoLinks(dest, target)
+		}
 		if err != nil {
 			return err
 		}
@@ -101,6 +105,7 @@ func readZip(zf *zip.File) ([]byte, error) {
 }
 
 func extractTar(r io.Reader, dest string) error {
+	dest = filepath.Clean(dest)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
@@ -114,6 +119,9 @@ func extractTar(r io.Reader, dest string) error {
 			return err
 		}
 		target, err := safeJoin(dest, h.Name)
+		if err == nil {
+			err = checkNoLinks(dest, target)
+		}
 		if err != nil {
 			return err
 		}
@@ -127,6 +135,9 @@ func extractTar(r io.Reader, dest string) error {
 		case tar.TypeLink:
 			var src string
 			if src, err = safeJoin(dest, h.Linkname); err == nil {
+				err = checkNoLinks(dest, src)
+			}
+			if err == nil {
 				_ = os.Remove(target)
 				if err = os.Link(src, target); err != nil {
 					err = copyFile(src, target)
@@ -153,11 +164,32 @@ func safeJoin(dest, name string) (string, error) {
 	return target, nil
 }
 
-func symlink(dest, target, link string) error {
-	if filepath.IsAbs(link) {
-		return fmt.Errorf("unsafe absolute link %s -> %s", target, link)
+// checkNoLinks rejects a target whose parent directories include a symbolic
+// link extracted earlier: writing through it could end up outside dest.
+func checkNoLinks(dest, target string) error {
+	if target == dest { // "./" entry
+		return nil
 	}
-	if _, err := safeJoin(dest, filepath.Join(mustRel(dest, filepath.Dir(target)), link)); err != nil {
+	rel, err := filepath.Rel(dest, filepath.Dir(target))
+	if err != nil || rel == "." {
+		return err
+	}
+	p := dest
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		p = filepath.Join(p, part)
+		st, err := os.Lstat(p)
+		if err != nil {
+			return nil // not created yet: it becomes a real directory
+		}
+		if st.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("unsafe path in archive: %s is below a symbolic link", target)
+		}
+	}
+	return nil
+}
+
+func symlink(dest, target, link string) error {
+	if filepath.IsAbs(link) || filepath.VolumeName(link) != "" || !linkInside(dest, filepath.Dir(target), link) {
 		return fmt.Errorf("unsafe link %s -> %s", target, link)
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -167,12 +199,31 @@ func symlink(dest, target, link string) error {
 	return os.Symlink(link, target)
 }
 
-func mustRel(base, p string) string {
-	rel, err := filepath.Rel(base, p)
-	if err != nil {
-		return p
+// linkInside resolves link relative to dir one component at a time and
+// reports whether it stays inside root. Passing through an existing symbolic
+// link is refused, because a ".." after it would not resolve lexically.
+func linkInside(root, dir, link string) bool {
+	p := dir
+	parts := strings.Split(filepath.ToSlash(link), "/")
+	for i, part := range parts {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if p == root {
+				return false
+			}
+			p = filepath.Dir(p)
+			continue
+		}
+		p = filepath.Join(p, part)
+		if i < len(parts)-1 {
+			if st, err := os.Lstat(p); err == nil && st.Mode()&fs.ModeSymlink != 0 {
+				return false
+			}
+		}
 	}
-	return rel
+	return true
 }
 
 func writeFile(target string, r io.Reader, perm fs.FileMode) error {

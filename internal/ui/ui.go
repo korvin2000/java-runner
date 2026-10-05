@@ -27,7 +27,8 @@ import (
 var (
 	out     io.Writer = os.Stderr
 	tty               = platform.IsTerminal(os.Stderr)
-	color             = tty && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb" && platform.EnableANSI(os.Stderr)
+	ansi              = tty && os.Getenv("TERM") != "dumb" && platform.EnableANSI(os.Stderr) // cursor control: spinner, progress bar
+	color             = ansi && os.Getenv("NO_COLOR") == ""
 	unicode           = runtime.GOOS != "windows" || os.Getenv("WT_SESSION") != "" || os.Getenv("TERM_PROGRAM") != ""
 	verbose bool
 	mu      sync.Mutex // serializes writes from the spinner and other output
@@ -110,7 +111,7 @@ func Warn(format string, a ...any) { line("  "+paint(yellow, g.warn)+" ", format
 // Debug prints only in verbose mode.
 func Debug(format string, a ...any) {
 	if verbose {
-		line("  "+paint(dim, g.dot)+" ", paint(dim, fmt.Sprintf(format, a...)))
+		line("  "+paint(dim, g.dot)+" ", "%s", paint(dim, fmt.Sprintf(format, a...)))
 	}
 }
 
@@ -184,7 +185,7 @@ var spinning string // text of the running spinner, "" if none
 
 // clearSpinner erases the spinner line; the caller holds mu.
 func clearSpinner() {
-	if spinning != "" && tty {
+	if spinning != "" && ansi {
 		fmt.Fprint(out, "\r\033[K")
 	}
 }
@@ -194,7 +195,7 @@ func clearSpinner() {
 func Spin(format string, a ...any) func(ok bool, result string) {
 	text := fmt.Sprintf(format, a...)
 	start := time.Now()
-	if !tty {
+	if !ansi {
 		Info("%s...", text)
 		return func(ok bool, result string) {
 			if ok {
@@ -254,13 +255,19 @@ func (b *Bar) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Finish draws the final state and ends the line.
-func (b *Bar) Finish() {
-	b.render(true)
-	if tty {
-		mu.Lock()
-		fmt.Fprint(out, "\r\033[K")
-		mu.Unlock()
+// Finish draws the final state and ends the line; ok tells whether the
+// download completed.
+func (b *Bar) Finish(ok bool) {
+	if !ansi {
+		if ok {
+			b.render(true)
+		}
+		return
+	}
+	mu.Lock()
+	fmt.Fprint(out, "\r\033[K")
+	mu.Unlock()
+	if ok {
 		Success("downloaded %s%s", Size(b.done), took(b.start))
 	}
 }
@@ -277,10 +284,10 @@ func (b *Bar) render(final bool) {
 	}
 	rate := float64(b.done) / elapsed
 	speed := Size(int64(rate)) + "/s"
-	if !tty {
+	if !ansi {
 		if b.total > 0 {
 			pct := b.done * 100 / b.total
-			if pct/25 > b.lastPct/25 || final {
+			if pct/25 > b.lastPct/25 || (final && pct != b.lastPct) {
 				b.lastPct = pct
 				Info("%3d%%  %s / %s  %s", pct, Size(b.done), Size(b.total), speed)
 			}

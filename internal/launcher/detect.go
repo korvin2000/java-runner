@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // URL detection for web applications without a configured browser.url: the
@@ -52,11 +54,14 @@ func isLocalHost(h string) bool {
 	h = strings.ToLower(h)
 	switch {
 	case h == "localhost", h == "0.0.0.0", h == "::", h == "::1", h == "0:0:0:0:0:0:0:1",
-		strings.HasPrefix(h, "127."), strings.HasSuffix(h, ".localhost"), strings.HasSuffix(h, ".local"):
+		strings.HasPrefix(h, "127."), strings.HasSuffix(h, ".localhost"):
 		return true
 	}
-	if name, err := os.Hostname(); err == nil && strings.EqualFold(name, h) {
-		return true
+	// This computer's own name, also as an mDNS ".local" name; other ".local"
+	// hosts are other machines.
+	if name, err := os.Hostname(); err == nil && name != "" {
+		name = strings.TrimSuffix(strings.ToLower(name), ".local")
+		return h == name || h == name+".local"
 	}
 	return false
 }
@@ -74,10 +79,11 @@ func localURL(u *url.URL) string {
 	return u.String()
 }
 
-// watchOutput copies r to w and calls found with the first local URL seen in
-// the stream. Output is forwarded immediately, so nothing is delayed or lost
-// even for very long lines (only the first 8 KB of a line are inspected).
-func watchOutput(r io.Reader, w io.Writer, found func(string), wg *sync.WaitGroup) {
+// watchOutput copies r to w, records the time of the latest output in
+// lastOutput and calls found with the first local URL seen in the stream.
+// Output is forwarded immediately, so nothing is delayed or lost even for
+// very long lines (only the first 8 KB of a line are inspected).
+func watchOutput(r io.Reader, w io.Writer, found func(string), lastOutput *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 	buf := make([]byte, 32*1024)
 	var line []byte
@@ -85,6 +91,7 @@ func watchOutput(r io.Reader, w io.Writer, found func(string), wg *sync.WaitGrou
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
+			lastOutput.Store(time.Now().UnixNano())
 			_, _ = w.Write(buf[:n])
 			if !done {
 				for _, b := range buf[:n] {

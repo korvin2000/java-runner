@@ -2,6 +2,7 @@ package jre
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -25,6 +26,10 @@ type artifact struct {
 	note           string // e.g. "JDK, this vendor publishes no JRE"
 }
 
+// localError is a failure on this computer (e.g. files in use) that another
+// download source cannot fix.
+type localError struct{ error }
+
 // Download fetches Java feature release `feature` from the first source
 // that works, verifies and unpacks it into dir (replacing its content) and
 // checks that it runs on this machine.
@@ -42,6 +47,10 @@ func Download(ctx context.Context, sources []config.Source, feature int, req Req
 			if rt, err = install(ctx, a, req, dir); err == nil {
 				return rt, nil
 			}
+			var le localError
+			if errors.As(err, &le) {
+				return nil, le.error
+			}
 		}
 		ui.Warn("%v", err)
 		errs = append(errs, src.Label()+": "+err.Error())
@@ -52,7 +61,7 @@ func Download(ctx context.Context, sources []config.Source, feature int, req Req
 
 func install(ctx context.Context, a *artifact, req Requirement, dir string) (*Runtime, error) {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
-		return nil, err
+		return nil, localError{err}
 	}
 	file := dir + ".download"
 	defer os.Remove(file)
@@ -93,7 +102,7 @@ func install(ctx context.Context, a *artifact, req Requirement, dir string) (*Ru
 	rel, _ := filepath.Rel(tmp, home)
 	if err := fsutil.ReplaceDir(tmp, dir); err != nil {
 		os.RemoveAll(tmp)
-		return nil, err
+		return nil, localError{fmt.Errorf("cannot replace %s (%v); if the application is running, close it and try again", dir, err)}
 	}
 	rt.Home = filepath.Join(dir, rel)
 	rt.Source = "downloaded"

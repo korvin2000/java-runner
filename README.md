@@ -171,7 +171,9 @@ it is downloaded once.
 
 With `"browser": {"url": "http://localhost:8080/"}` the launcher starts the
 JVM, polls the port and opens the URL in the default browser when it accepts
-connections (`timeout` seconds, default 120).
+connections. Slow starts are fine (large Spring Boot apps may need minutes):
+the launcher keeps waiting as long as the JVM runs; after `timeout` seconds
+(default 120) it only prints a hint that the app is still starting.
 
 With `"browser": {}` the launcher reads the application's own output and opens
 the first local address it announces, for example:
@@ -187,6 +189,9 @@ Only addresses on this machine (`localhost`, `127.x`, `0.0.0.0`, `::1`, the
 host name) are considered, so links to documentation in log messages are
 ignored. This also works with `server.port=0` (random port). The launcher
 still waits for the port to accept connections before opening the browser.
+The wait is not limited while the application runs; `timeout` counts from its
+latest output line, so an app that keeps logging during a long startup is not
+cut short, and a URL announced late still opens the browser.
 `jrunner init` configures this automatically for Spring Boot jars.
 `--jrunner-no-browser` starts the app without opening anything.
 

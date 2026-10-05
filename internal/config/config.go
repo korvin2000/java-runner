@@ -124,7 +124,7 @@ func (s Source) Label() string {
 // printed http://localhost... URL).
 type Browser struct {
 	URL     string `json:"url,omitempty"`     // e.g. "http://localhost:8080/"; empty = detect from the log
-	Timeout int    `json:"timeout,omitempty"` // seconds to wait for the port / URL (default 120)
+	Timeout int    `json:"timeout,omitempty"` // seconds until a "still starting" hint (default 120); waiting continues while the app runs
 }
 
 // Update configures the update channel.
@@ -221,8 +221,13 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Version) == "" {
 		add("version is required")
 	}
-	if c.ID == "" || strings.Trim(c.ID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_") != "" {
+	switch {
+	case c.ID == "":
+		add("id is required (it cannot be derived from name %q)", c.Name)
+	case strings.Trim(c.ID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_") != "":
 		add("id %q may only contain letters, digits, '.', '-' and '_'", c.ID)
+	case strings.Trim(c.ID, ".") == "":
+		add("id %q is not a valid directory name", c.ID) // "." or ".." would escape the programs folder
 	}
 	if c.Jar == "" && c.Java.MainClass == "" && c.Java.Module == "" {
 		add("one of jar, java.mainClass or java.module is required")
@@ -232,6 +237,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Java.MaxVersion != 0 && c.Java.MaxVersion < c.Java.MinVersion {
 		add("java.maxVersion (%d) is lower than java.minVersion (%d)", c.Java.MaxVersion, c.Java.MinVersion)
+	}
+	if d := c.Java.DownloadVersion; d != 0 && (d < c.Java.MinVersion || (c.Java.MaxVersion != 0 && d > c.Java.MaxVersion)) {
+		add("java.downloadVersion (%d) is outside java.minVersion..maxVersion", d)
 	}
 	for _, s := range c.Java.Download {
 		if s.URL == "" && !IsProvider(s.Provider) {

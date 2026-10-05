@@ -39,7 +39,8 @@ type launcher struct {
 	cfg      *config.Config // effective configuration (installed or embedded)
 	paths    paths
 	state    *state
-	setup    bool // something was installed or downloaded during this launch
+	override *jre.Runtime // <ID>_JAVA_HOME runtime for this launch (never saved)
+	setup    bool         // something was installed or downloaded during this launch
 }
 
 // Run executes the launcher and returns the process exit code.
@@ -203,10 +204,11 @@ func (l *launcher) ensureJava() error {
 		}
 		rt.Source = "override"
 		ui.Debug("using %s from %s", rt, envJavaHomeName(l.cfg.ID))
-		l.state.Java = rt
+		l.override = rt
 		return nil
 	}
-	if rt := l.state.Java; rt != nil && fsutil.IsFile(rt.Java()) && req.Accepts(rt) {
+	// "override" entries were saved by older versions and are not trusted.
+	if rt := l.state.Java; rt != nil && rt.Source != "override" && fsutil.IsFile(rt.Java()) && req.Accepts(rt) {
 		return nil
 	}
 	unlock, err := lock(l.paths.Install)
@@ -221,6 +223,14 @@ func (l *launcher) ensureJava() error {
 	l.setup = true
 	l.state.Java = rt
 	return l.state.save(l.paths.State)
+}
+
+// javaRuntime is the runtime used for this launch.
+func (l *launcher) javaRuntime() *jre.Runtime {
+	if l.override != nil {
+		return l.override
+	}
+	return l.state.Java
 }
 
 func (l *launcher) resolveJava(req jre.Requirement) (*jre.Runtime, error) {
@@ -261,8 +271,12 @@ func requirement(c *config.Config) jre.Requirement {
 
 // cleanup removes leftovers of replaced files (Windows keeps running
 // executables and open jars locked until the process exits) and of
-// interrupted downloads.
+// interrupted downloads. It is skipped while another launcher holds the
+// install lock: the leftovers may be its work in progress.
 func (l *launcher) cleanup() {
+	if _, held := lockHolder(filepath.Join(l.paths.Install, ".lock")); held {
+		return
+	}
 	for _, p := range []string{
 		l.paths.Launcher + ".old", l.paths.App + ".old", l.paths.App + ".new",
 		l.paths.Runtime + ".old", l.paths.Runtime + ".new", l.paths.Runtime + ".download", l.paths.Runtime + ".download.part",
@@ -357,11 +371,8 @@ func lock(dir string) (func(), error) {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
-		var pid int
-		if data, err := os.ReadFile(name); err == nil {
-			fmt.Sscan(string(data), &pid)
-		}
-		if pid <= 0 || pid == os.Getpid() || !platform.ProcessAlive(pid) {
+		pid, held := lockHolder(name)
+		if !held {
 			os.Remove(name)
 			continue
 		}
@@ -374,6 +385,22 @@ func lock(dir string) (func(), error) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// lockHolder reads the lock file name and reports the owning process and
+// whether it is another live process. A lock without a pid is still being
+// written by its owner unless it is older than a few seconds.
+func lockHolder(name string) (pid int, held bool) {
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return 0, false
+	}
+	fmt.Sscan(string(data), &pid)
+	if pid <= 0 {
+		st, err := os.Stat(name)
+		return 0, err == nil && time.Since(st.ModTime()) < 10*time.Second
+	}
+	return pid, pid != os.Getpid() && platform.ProcessAlive(pid)
 }
 
 func (l *launcher) printHelp() {

@@ -29,16 +29,31 @@ func IsDir(p string) bool {
 }
 
 // WriteFileAtomic writes data to a temporary file and renames it over path, so
-// readers never observe a half-written file.
+// readers never observe a half-written file. The temporary name is unique, so
+// concurrent writers (two running launchers) cannot mix their data.
 func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return ReplaceFile(tmp, path)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, perm)
+	}
+	if err == nil {
+		err = ReplaceFile(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 // ReplaceFile moves src over dst. Windows cannot overwrite a running

@@ -34,9 +34,15 @@ func Init(jar string, force bool) error {
 	if err != nil {
 		return err
 	}
+	id := config.MakeID(info.name)
+	if id == "" { // e.g. a name in a non-Latin script
+		if id = config.MakeID(jarBaseName(jar)); id == "" {
+			id = "app"
+		}
+	}
 	cfg := &config.Config{
 		Name:    info.name,
-		ID:      config.MakeID(info.name),
+		ID:      id,
 		Version: info.version,
 		Jar:     filepath.ToSlash(jar),
 		Java: config.Java{
@@ -89,7 +95,7 @@ func inspectJar(jar string) (*jarInfo, error) {
 	mf := manifest(readEntry(&zr.Reader, "META-INF/MANIFEST.MF"))
 	info := &jarInfo{name: mf["Implementation-Title"], version: mf["Implementation-Version"], java: 17}
 	if info.name == "" {
-		info.name = regexp.MustCompile(`-\d.*$`).ReplaceAllString(strings.TrimSuffix(filepath.Base(jar), ".jar"), "")
+		info.name = jarBaseName(jar)
 	}
 	if info.version == "" {
 		info.version = "1.0.0"
@@ -114,12 +120,25 @@ func inspectJar(jar string) (*jarInfo, error) {
 			}
 		}
 		info.port = 8080
-		if p, err := strconv.Atoi(propDefault(props["server.port"])); err == nil {
-			info.port = p // 0 means a random port: no browser
+		if v, ok := props["server.port"]; ok {
+			// 0 (a random port) or a value that cannot be resolved here:
+			// the URL is detected from the log.
+			info.port, _ = strconv.Atoi(propDefault(v))
 		}
 		info.contextPath = propDefault(props["server.servlet.context-path"])
 	}
 	return info, nil
+}
+
+var (
+	versionSuffix = regexp.MustCompile(`-\d.*$`)
+	auxiliaryJar  = regexp.MustCompile(`-(sources|javadoc|plain|tests)\.jar$`)
+)
+
+// jarBaseName returns the jar's file name without version and extension,
+// e.g. "demo-app" for target/demo-app-1.2.0.jar.
+func jarBaseName(jar string) string {
+	return versionSuffix.ReplaceAllString(strings.TrimSuffix(filepath.Base(jar), ".jar"), "")
 }
 
 func guessJar() string {
@@ -129,7 +148,7 @@ func guessJar() string {
 		m, _ := filepath.Glob(pattern)
 		sort.Strings(m)
 		for _, f := range m {
-			if regexp.MustCompile(`-(sources|javadoc|plain|tests)\.jar$`).MatchString(f) {
+			if auxiliaryJar.MatchString(f) {
 				continue
 			}
 			if st, err := os.Stat(f); err == nil && st.Size() > bestSize {
@@ -215,6 +234,9 @@ func parseYAML(text string, props map[string]string) {
 			stack = stack[:len(stack)-1]
 		}
 		key := strings.TrimSpace(k)
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = v[:i] // trailing comment
+		}
 		if v = strings.Trim(strings.TrimSpace(v), `"'`); v == "" {
 			stack = append(stack, level{indent, key})
 			continue

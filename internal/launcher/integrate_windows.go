@@ -29,7 +29,7 @@ func createIntegrations(in integration) ([]string, error) {
 		fmt.Fprintf(&b, "function New-Link($dir) { $p = Join-Path $dir %s; $s = $ws.CreateShortcut($p); "+
 			"$s.TargetPath = %s; $s.WorkingDirectory = %s; $s.Description = %s; if (%s) { $s.IconLocation = %s }; "+
 			"$s.Save(); Write-Output $p }\n",
-			psq(in.Name+".lnk"), psq(in.Launcher), psq(in.InstallDir), psq(in.Name), psq(in.Icon), psq(in.Icon))
+			psq(in.fileName()+".lnk"), psq(in.Launcher), psq(in.InstallDir), psq(in.Name), psq(in.Icon), psq(in.Icon))
 		if in.Desktop {
 			b.WriteString("New-Link ([Environment]::GetFolderPath('Desktop'))\n")
 		}

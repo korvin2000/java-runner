@@ -207,6 +207,9 @@ func runtimeFor(cfg *config.Config, base, target string) (string, error) {
 // directory, <tool dir>/stubs or the tool directory.
 func findStub(target, dir string) (string, error) {
 	self, err := os.Executable()
+	if err == nil {
+		self, err = filepath.EvalSymlinks(self) // look for stubs next to the real file, not a link to it
+	}
 	if err != nil {
 		return "", err
 	}
