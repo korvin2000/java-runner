@@ -1,0 +1,26 @@
+{
+  "name": "Demo Shop",
+  "id": "demo-shop",
+  "version": "1.4.2",
+  "publisher": "ACME Inc.",
+  "jar": "target/demo-shop-1.4.2.jar",
+  "icons": ["src/main/dist/shop.ico", "src/main/dist/shop.icns", "src/main/dist/shop.png"],
+
+  "java": {
+    "minVersion": 17,
+    "downloadVersion": 21,
+    "options": [
+      "-Xmx768m",
+      "-Dspring.profiles.active=desktop",
+      "-Dlogging.file.name=${DATA_DIR}/logs/demo-shop.log",
+      "-Dspring.datasource.url=jdbc:h2:file:${DATA_DIR}/db/shop"
+    ],
+    "env": { "SPRING_CONFIG_ADDITIONAL_LOCATION": "optional:file:${DATA_DIR}/application.yml" }
+  },
+
+  "browser": {},
+
+  "update": { "url": "https://downloads.example.com/demo-shop/update.json", "intervalHours": 24 },
+
+  "install": { "desktopShortcut": true, "menuShortcut": true }
+}

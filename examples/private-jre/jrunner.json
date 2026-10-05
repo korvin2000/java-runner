@@ -1,0 +1,22 @@
+{
+  "name": "Ledger",
+  "id": "ledger",
+  "version": "5.2.1",
+  "jar": "target/ledger-5.2.1.jar",
+
+  "java": {
+    "minVersion": 17,
+    "maxVersion": 17,
+    "download": [
+      {
+        "url": "https://artifacts.example.com/java/{version}/jre-{version}-{os}-{arch}.{ext}",
+        "sha256": "https://artifacts.example.com/java/{version}/jre-{version}-{os}-{arch}.{ext}.sha256"
+      },
+      "adoptium"
+    ],
+    "options": ["-Xmx512m"]
+  },
+
+  "browser": { "url": "http://localhost:7000/" },
+  "update": { "url": "https://artifacts.example.com/ledger/update.json" }
+}

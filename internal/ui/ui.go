@@ -1,8 +1,14 @@
 // Package ui prints progress to the console in a compact, readable form:
 //
-//	==> step
-//	    detail
-//	  ! warning
+//	▸ step
+//	  detail
+//	  ✓ success
+//	  ⚠ warning
+//	  [████████░░░░░░░░░░░░]  41%  21.3 MB / 51.8 MB  6.2 MB/s  ETA 5s
+//
+// Colors and Unicode glyphs are used on terminals that support them (Windows
+// Terminal, every modern Unix terminal); legacy Windows consoles get ASCII.
+// NO_COLOR disables colors.
 package ui
 
 import (
@@ -10,7 +16,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/korvin2000/java-runner/internal/platform"
@@ -19,33 +27,95 @@ import (
 var (
 	out     io.Writer = os.Stderr
 	tty               = platform.IsTerminal(os.Stderr)
+	color             = tty && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb" && platform.EnableANSI(os.Stderr)
+	unicode           = runtime.GOOS != "windows" || os.Getenv("WT_SESSION") != "" || os.Getenv("TERM_PROGRAM") != ""
 	verbose bool
+	mu      sync.Mutex // serializes writes from the spinner and other output
 )
+
+const (
+	reset  = "\033[0m"
+	bold   = "\033[1m"
+	dim    = "\033[2m"
+	red    = "\033[31m"
+	green  = "\033[32m"
+	yellow = "\033[33m"
+	cyan   = "\033[36m"
+)
+
+type glyphs struct{ step, ok, warn, err, dot, full, empty string }
+
+var g = func() glyphs {
+	if unicode {
+		return glyphs{"▸", "✓", "⚠", "✗", "·", "█", "░"}
+	}
+	return glyphs{">", "+", "!", "x", ".", "#", "-"}
+}()
+
+var spinFrames = func() []string {
+	if unicode {
+		return []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	}
+	return []string{"-", "\\", "|", "/"}
+}()
+
+func paint(c, s string) string {
+	if !color {
+		return s
+	}
+	return c + s + reset
+}
 
 // SetVerbose enables Debug output.
 func SetVerbose(v bool) { verbose = v }
 
+// Colors reports whether colored output is active.
+func Colors() bool { return color }
+
+// took formats an elapsed time for a result line; short durations are omitted.
+func took(start time.Time) string {
+	if d := time.Since(start); d >= 500*time.Millisecond {
+		return " " + paint(dim, "("+Duration(d)+")")
+	}
+	return ""
+}
+
 // Interactive reports whether the user can answer questions.
 func Interactive() bool { return tty && platform.IsTerminal(os.Stdin) }
 
+func line(prefix, format string, a ...any) {
+	mu.Lock()
+	defer mu.Unlock()
+	clearSpinner()
+	fmt.Fprintf(out, prefix+format+"\n", a...)
+}
+
+// Title prints the application banner shown on first launch.
+func Title(name, version, note string) {
+	line("", "%s %s  %s", paint(bold, name), paint(dim, version), paint(dim, note))
+}
+
 // Step announces a major action.
-func Step(format string, a ...any) { fmt.Fprintf(out, "==> "+format+"\n", a...) }
+func Step(format string, a ...any) { line(paint(cyan+bold, g.step)+" ", format, a...) }
 
 // Info prints a detail line under the current step.
-func Info(format string, a ...any) { fmt.Fprintf(out, "    "+format+"\n", a...) }
+func Info(format string, a ...any) { line("  ", format, a...) }
+
+// Success prints a completed detail.
+func Success(format string, a ...any) { line("  "+paint(green, g.ok)+" ", format, a...) }
 
 // Warn prints a non-fatal problem.
-func Warn(format string, a ...any) { fmt.Fprintf(out, "  ! "+format+"\n", a...) }
+func Warn(format string, a ...any) { line("  "+paint(yellow, g.warn)+" ", format, a...) }
 
 // Debug prints only in verbose mode.
 func Debug(format string, a ...any) {
 	if verbose {
-		fmt.Fprintf(out, "    . "+format+"\n", a...)
+		line("  "+paint(dim, g.dot)+" ", paint(dim, fmt.Sprintf(format, a...)))
 	}
 }
 
 // Error prints a fatal error.
-func Error(err error) { fmt.Fprintf(out, "error: %v\n", err) }
+func Error(err error) { line(paint(red+bold, g.err)+" ", "%v", err) }
 
 // Confirm asks a yes/no question; without a terminal it returns def.
 func Confirm(question string, def bool) bool {
@@ -56,15 +126,18 @@ func Confirm(question string, def bool) bool {
 	if def {
 		hint = "[Y/n]"
 	}
-	fmt.Fprintf(out, "==> %s %s ", question, hint)
+	mu.Lock()
+	clearSpinner()
+	fmt.Fprintf(out, "%s %s %s ", paint(cyan+bold, "?"), question, paint(dim, hint))
+	mu.Unlock()
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && line == "" {
 		return def
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
+	case "y", "yes", "д", "да":
 		return true
-	case "n", "no":
+	case "n", "no", "н", "нет":
 		return false
 	}
 	return def
@@ -77,7 +150,7 @@ func PauseIfOwnConsole() {
 	if !platform.OwnConsole() {
 		return
 	}
-	fmt.Fprint(out, "\nPress Enter to close this window...")
+	fmt.Fprint(out, "\n"+paint(dim, "Press Enter to close this window..."))
 	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
@@ -93,6 +166,72 @@ func Size(n int64) string {
 	}
 	return fmt.Sprintf("%.1f %cB", f, "KMGT"[i])
 }
+
+// Duration formats d compactly: "0.8s", "12s", "2m05s".
+func Duration(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+// ---- spinner -------------------------------------------------------------
+
+var spinning string // text of the running spinner, "" if none
+
+// clearSpinner erases the spinner line; the caller holds mu.
+func clearSpinner() {
+	if spinning != "" && tty {
+		fmt.Fprint(out, "\r\033[K")
+	}
+}
+
+// Spin shows an animated indicator for an action without measurable
+// progress. The returned function ends it with a success or failure line.
+func Spin(format string, a ...any) func(ok bool, result string) {
+	text := fmt.Sprintf(format, a...)
+	start := time.Now()
+	if !tty {
+		Info("%s...", text)
+		return func(ok bool, result string) {
+			if ok {
+				Success("%s%s", result, took(start))
+			}
+		}
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for i := 0; ; i++ {
+			mu.Lock()
+			spinning = text
+			fmt.Fprintf(out, "\r\033[K  %s %s", paint(cyan, spinFrames[i%len(spinFrames)]), text)
+			mu.Unlock()
+			select {
+			case <-done:
+				return
+			case <-time.After(80 * time.Millisecond):
+			}
+		}
+	}()
+	return func(ok bool, result string) {
+		close(done)
+		<-finished
+		mu.Lock()
+		clearSpinner()
+		spinning = ""
+		mu.Unlock()
+		if ok {
+			Success("%s%s", result, took(start))
+		}
+	}
+}
+
+// ---- progress bar --------------------------------------------------------
 
 // Bar is a download progress bar. It implements io.Writer, so it can be fed
 // through io.MultiWriter. On a terminal it redraws one line; otherwise it
@@ -119,45 +258,55 @@ func (b *Bar) Write(p []byte) (int, error) {
 func (b *Bar) Finish() {
 	b.render(true)
 	if tty {
-		fmt.Fprintln(out)
+		mu.Lock()
+		fmt.Fprint(out, "\r\033[K")
+		mu.Unlock()
+		Success("downloaded %s%s", Size(b.done), took(b.start))
 	}
 }
 
 func (b *Bar) render(final bool) {
 	now := time.Now()
-	if !final && now.Sub(b.last) < 120*time.Millisecond {
+	if !final && now.Sub(b.last) < 100*time.Millisecond {
 		return
 	}
 	b.last = now
-	secs := now.Sub(b.start).Seconds()
-	if secs < 0.001 {
-		secs = 0.001
+	elapsed := now.Sub(b.start).Seconds()
+	if elapsed < 0.001 {
+		elapsed = 0.001
 	}
-	speed := Size(int64(float64(b.done)/secs)) + "/s"
+	rate := float64(b.done) / elapsed
+	speed := Size(int64(rate)) + "/s"
 	if !tty {
 		if b.total > 0 {
 			pct := b.done * 100 / b.total
 			if pct/25 > b.lastPct/25 || final {
 				b.lastPct = pct
-				Info("%3d%%  %s / %s", pct, Size(b.done), Size(b.total))
+				Info("%3d%%  %s / %s  %s", pct, Size(b.done), Size(b.total), speed)
 			}
 		} else if final {
-			Info("%s", Size(b.done))
+			Info("%s  %s", Size(b.done), speed)
 		}
 		return
 	}
-	var line string
+	var text string
 	if b.total > 0 {
-		const width = 30
+		const width = 24
 		pct := b.done * 100 / b.total
 		n := int(b.done * width / b.total)
 		if n > width {
 			n = width
 		}
-		line = fmt.Sprintf("    [%s%s] %3d%%  %s / %s  %s",
-			strings.Repeat("#", n), strings.Repeat("-", width-n), pct, Size(b.done), Size(b.total), speed)
+		eta := ""
+		if rate > 0 && b.done < b.total && elapsed > 1 {
+			eta = "  ETA " + Duration(time.Duration(float64(b.total-b.done)/rate*float64(time.Second)))
+		}
+		bar := paint(cyan, strings.Repeat(g.full, n)) + paint(dim, strings.Repeat(g.empty, width-n))
+		text = fmt.Sprintf("  [%s] %3d%%  %s / %s  %s%s", bar, pct, Size(b.done), Size(b.total), paint(dim, speed), paint(dim, eta))
 	} else {
-		line = fmt.Sprintf("    %s  %s", Size(b.done), speed)
+		text = fmt.Sprintf("  %s %s  %s", paint(cyan, spinFrames[int(elapsed*10)%len(spinFrames)]), Size(b.done), paint(dim, speed))
 	}
-	fmt.Fprintf(out, "\r%-78s", line)
+	mu.Lock()
+	fmt.Fprintf(out, "\r\033[K%s", text)
+	mu.Unlock()
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/korvin2000/java-runner/internal/fetch"
+	"github.com/korvin2000/java-runner/internal/fsutil"
 	"github.com/korvin2000/java-runner/internal/pkg"
 	"github.com/korvin2000/java-runner/internal/platform"
 	"github.com/korvin2000/java-runner/internal/ui"
@@ -39,21 +40,15 @@ func (l *launcher) checkUpdate(forced bool) (bool, error) {
 	} else {
 		ui.Debug("checking for updates at %s", u.URL)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var m pkg.Manifest
-	err := fetch.JSON(ctx, u.URL, &m)
+	m, err := l.fetchManifest(10 * time.Second)
 	l.state.LastUpdateCheck = time.Now()
 	_ = l.state.save(l.paths.State)
 	if err != nil {
 		return false, err
 	}
-	if m.Version == "" {
-		return false, fmt.Errorf("%s: no version in update manifest", u.URL)
-	}
 	if version.Compare(m.Version, l.cfg.Version) <= 0 {
 		if forced {
-			ui.Info("%s %s is up to date", l.cfg.Name, l.cfg.Version)
+			ui.Success("%s %s is up to date", l.cfg.Name, l.cfg.Version)
 		}
 		return false, nil
 	}
@@ -66,34 +61,12 @@ func (l *launcher) checkUpdate(forced bool) (bool, error) {
 		ui.Info("not installed; run \"%s %supdate\" to install it later", l.paths.Launcher, flagPrefix)
 		return false, nil
 	}
-	asset := pkg.Asset{URL: m.URL, SHA256: m.SHA256}
-	if a, ok := m.Platforms[platform.Key()]; ok {
-		asset = a
-	}
-	if asset.URL == "" {
-		return false, fmt.Errorf("update %s has no package for %s", m.Version, platform.Key())
-	}
-	pkgURL, err := resolveRef(u.URL, asset.URL)
+	p, done, err := l.downloadPackage(m)
 	if err != nil {
 		return false, err
 	}
-
-	file := filepath.Join(l.paths.Install, updateFile)
-	defer os.Remove(file)
-	ui.Info("downloading %s", pkgURL)
-	if err := fetch.File(context.Background(), pkgURL, file, asset.SHA256); err != nil {
-		return false, err
-	}
-	p, err := pkg.OpenFile(file)
-	if err != nil {
-		return false, err
-	}
-	defer p.Close()
+	defer done()
 	switch {
-	case p.Config.ID != l.cfg.ID:
-		return false, fmt.Errorf("update package is for %q, not %q", p.Config.ID, l.cfg.ID)
-	case !p.HasApp:
-		return false, errors.New("update package contains no application files")
 	case version.Compare(p.Config.Version, m.Version) != 0:
 		return false, fmt.Errorf("update package contains version %s, but update.json announces %s", p.Config.Version, m.Version)
 	case p.Config.Build != nil && p.Config.Build.BundledRuntime != p.HasRuntime:
@@ -104,6 +77,89 @@ func (l *launcher) checkUpdate(forced bool) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// fetchManifest downloads and validates update.json.
+func (l *launcher) fetchManifest(timeout time.Duration) (*pkg.Manifest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var m pkg.Manifest
+	if err := fetch.JSON(ctx, l.cfg.Update.URL, &m); err != nil {
+		return nil, err
+	}
+	if m.Version == "" {
+		return nil, fmt.Errorf("%s: no version in update manifest", l.cfg.Update.URL)
+	}
+	return &m, nil
+}
+
+// downloadPackage fetches the package announced by m for this platform,
+// verifies it and opens it. done removes the temporary file.
+func (l *launcher) downloadPackage(m *pkg.Manifest) (p *pkg.Package, done func(), err error) {
+	asset := pkg.Asset{URL: m.URL, SHA256: m.SHA256}
+	if a, ok := m.Platforms[platform.Key()]; ok {
+		asset = a
+	}
+	if asset.URL == "" {
+		return nil, nil, fmt.Errorf("version %s has no package for %s", m.Version, platform.Key())
+	}
+	pkgURL, err := resolveRef(l.cfg.Update.URL, asset.URL)
+	if err != nil {
+		return nil, nil, err
+	}
+	if asset.SHA256 == "" {
+		ui.Warn("update.json has no sha256 for the package, integrity not verified")
+	}
+	file := filepath.Join(l.paths.Install, updateFile)
+	if err := os.MkdirAll(l.paths.Install, 0o755); err != nil {
+		return nil, nil, err
+	}
+	ui.Info("downloading %s", pkgURL)
+	if err := fetch.File(context.Background(), pkgURL, file, asset.SHA256); err != nil {
+		os.Remove(file)
+		return nil, nil, err
+	}
+	p, err = pkg.OpenFile(file)
+	if err != nil {
+		os.Remove(file)
+		return nil, nil, err
+	}
+	done = func() { p.Close(); os.Remove(file) }
+	switch {
+	case p.Config.ID != l.cfg.ID:
+		done()
+		return nil, nil, fmt.Errorf("package is for %q, not %q", p.Config.ID, l.cfg.ID)
+	case !p.HasApp:
+		done()
+		return nil, nil, errors.New("package contains no application files")
+	}
+	return p, done, nil
+}
+
+// bootstrap installs a thin launcher: the application package is downloaded
+// from the update channel and the launcher binary itself is installed.
+func (l *launcher) bootstrap() error {
+	ui.Step("Downloading %s from %s", l.cfg.Name, l.cfg.Update.URL)
+	m, err := l.fetchManifest(30 * time.Second)
+	if err != nil {
+		return fmt.Errorf("cannot reach the download server: %w", err)
+	}
+	ui.Info("latest version: %s", m.Version)
+	p, done, err := l.downloadPackage(m)
+	if err != nil {
+		return err
+	}
+	defer done()
+	if !samePath(l.exe, l.paths.Launcher) {
+		if err := fsutil.CopyFile(l.exe, l.paths.Launcher, 0o755); err != nil {
+			return fmt.Errorf("installing launcher: %w", err)
+		}
+	}
+	if err := l.install(p, false); err != nil {
+		return err
+	}
+	l.state.LastUpdateCheck = time.Now()
+	return l.state.save(l.paths.State)
 }
 
 // resolveRef resolves a package URL relative to the manifest URL, so that

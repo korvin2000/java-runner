@@ -33,6 +33,7 @@ type Options struct {
 	Out     string   // output directory
 	Stubs   string   // directory with jrunner-<target> stubs for other platforms
 	Version string   // overrides the version in the configuration (CI builds)
+	Thin    bool     // launchers without the application: it is downloaded from update.url
 }
 
 type entry struct{ name, src string } // package entry name and source file
@@ -52,6 +53,9 @@ func Build(o Options) error {
 	}
 	if u := cfg.Update; u != nil && !strings.HasPrefix(strings.ToLower(u.URL), "https://") {
 		ui.Warn("update.url %s is not https: update.json and its checksums could be tampered with in transit", u.URL)
+	}
+	if o.Thin && cfg.Update == nil {
+		return fmt.Errorf("--thin needs update.url: a thin launcher downloads the application from there")
 	}
 	base, err := filepath.Abs(filepath.Dir(o.Config))
 	if err != nil {
@@ -81,12 +85,16 @@ func Build(o Options) error {
 		if err != nil {
 			return err
 		}
-		out := filepath.Join(o.Out, fmt.Sprintf("%s-%s-%s%s", cfg.ID, cfg.Version, t, exeSuffix(t)))
-		if err := writeLauncher(out, stub, cfg, files, runtimes[t]); err != nil {
+		launcherFiles, launcherRuntime, suffix := files, runtimes[t], ""
+		if o.Thin {
+			launcherFiles, launcherRuntime, suffix = nil, "", "-thin"
+		}
+		out := filepath.Join(o.Out, fmt.Sprintf("%s-%s-%s%s%s", cfg.ID, cfg.Version, t, suffix, exeSuffix(t)))
+		if err := writeLauncher(out, stub, cfg, launcherFiles, launcherRuntime); err != nil {
 			return fmt.Errorf("%s: %w", t, err)
 		}
 		st, _ := os.Stat(out)
-		ui.Info("%-15s %s (%s)", t, out, ui.Size(st.Size()))
+		ui.Success("%-15s %s (%s)", t, out, ui.Size(st.Size()))
 	}
 	if cfg.Update != nil {
 		if err := writeUpdate(o.Out, cfg, files, targets, runtimes); err != nil {
@@ -343,7 +351,7 @@ func writeUpdate(out string, cfg *config.Config, files []entry, targets []string
 		return err
 	}
 	ui.Step("Update channel")
-	ui.Info("upload update.json and %s next to %s", strings.Join(names, ", "), cfg.Update.URL)
+	ui.Info("upload update.json and %s so that they are reachable at %s", strings.Join(names, ", "), cfg.Update.URL)
 	ui.Info("(add \"notes\" to update.json to show release notes to users)")
 	return nil
 }

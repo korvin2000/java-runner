@@ -21,7 +21,8 @@ import (
 )
 
 type artifact struct {
-	url, sha256, name string
+	url, sum, name string // sum: hex SHA-256 (or SHA-1 for vendors without SHA-256)
+	note           string // e.g. "JDK, this vendor publishes no JRE"
 }
 
 // Download fetches Java feature release `feature` from the first source
@@ -33,8 +34,8 @@ func Download(ctx context.Context, sources []config.Source, feature int, req Req
 		image = "jdk"
 	}
 	var errs []string
-	for _, src := range sources {
-		ui.Info("source: %s", src.Label())
+	for i, src := range sources {
+		ui.Info("source %d/%d: %s", i+1, len(sources), src.Label())
 		a, err := resolve(ctx, src, feature, image)
 		if err == nil {
 			var rt *Runtime
@@ -56,33 +57,35 @@ func install(ctx context.Context, a *artifact, req Requirement, dir string) (*Ru
 	file := dir + ".download"
 	defer os.Remove(file)
 	ui.Info("downloading %s", a.name)
-	if err := fetch.File(ctx, a.url, file, a.sha256); err != nil {
+	if a.note != "" {
+		ui.Info("%s", a.note)
+	}
+	if err := fetch.File(ctx, a.url, file, a.sum); err != nil {
 		return nil, err
 	}
-	if a.sha256 != "" {
-		ui.Info("checksum verified")
+	if a.sum != "" {
+		ui.Success("checksum verified")
 	} else {
 		ui.Warn("no checksum published for this download, integrity not verified")
 	}
-	ui.Info("unpacking")
 	tmp := dir + ".new"
 	_ = os.RemoveAll(tmp)
-	if err := archive.Extract(file, tmp); err != nil {
-		os.RemoveAll(tmp)
-		return nil, err
-	}
-	home, err := FindHome(tmp)
-	if err != nil {
-		os.RemoveAll(tmp)
-		return nil, err
-	}
-	FixPermissions(home)
-	rt, err := ProbeExec(home)
+	stop := ui.Spin("unpacking %s", a.name)
+	err := archive.Extract(file, tmp)
+	var home string
 	if err == nil {
-		if why := req.Check(rt); why != "" {
-			err = fmt.Errorf("downloaded runtime is not usable: %s", why)
+		home, err = FindHome(tmp)
+	}
+	var rt *Runtime
+	if err == nil {
+		FixPermissions(home)
+		if rt, err = ProbeExec(home); err == nil {
+			if why := req.Check(rt); why != "" {
+				err = fmt.Errorf("downloaded runtime is not usable: %s", why)
+			}
 		}
 	}
+	stop(err == nil, "Java "+versionOf(rt)+" works")
 	if err != nil {
 		os.RemoveAll(tmp)
 		return nil, err
@@ -97,6 +100,13 @@ func install(ctx context.Context, a *artifact, req Requirement, dir string) (*Ru
 	return rt, nil
 }
 
+func versionOf(rt *Runtime) string {
+	if rt == nil {
+		return ""
+	}
+	return rt.Version
+}
+
 func resolve(ctx context.Context, src config.Source, feature int, image string) (*artifact, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -107,8 +117,117 @@ func resolve(ctx context.Context, src config.Source, feature int, image string) 
 		return adoptium(ctx, feature, image)
 	case src.Provider == "zulu":
 		return zulu(ctx, feature, image)
+	case src.Provider == "corretto":
+		return corretto(ctx, feature, image)
+	case src.Provider == "liberica":
+		return liberica(ctx, feature, image)
+	case src.Provider == "microsoft":
+		return microsoft(ctx, feature, image)
 	}
 	return nil, fmt.Errorf("unknown source %q", src.Provider)
+}
+
+func archiveExt() string {
+	if runtime.GOOS == "windows" {
+		return "zip"
+	}
+	return "tar.gz"
+}
+
+// jdkOnly is the note shown when a vendor has no JRE build and a JDK is used.
+const jdkOnly = "this vendor publishes no JRE build for this release, using the (larger) JDK"
+
+// checksumFile fetches a "<hex> <name>" checksum file and returns the digest.
+func checksumFile(ctx context.Context, u string) (string, error) {
+	txt, err := fetch.Text(ctx, u)
+	if err != nil {
+		return "", fmt.Errorf("checksum: %w", err)
+	}
+	f := strings.Fields(txt)
+	if len(f) == 0 || (len(f[0]) != 64 && len(f[0]) != 40) {
+		return "", fmt.Errorf("checksum: %s has no digest", u)
+	}
+	return f[0], nil
+}
+
+// corretto uses Amazon's permanent "latest" download links. Corretto ships a
+// JRE only for Java 8.
+func corretto(ctx context.Context, feature int, image string) (*artifact, error) {
+	osName := map[string]string{"windows": "windows", "darwin": "macos", "linux": "linux"}[runtime.GOOS]
+	if platform.IsMusl() {
+		osName = "alpine-linux"
+	}
+	arch := map[string]string{"amd64": "x64", "arm64": "aarch64", "386": "x86"}[runtime.GOARCH]
+	if osName == "" || arch == "" {
+		return nil, fmt.Errorf("platform %s/%s is not supported by Corretto", runtime.GOOS, runtime.GOARCH)
+	}
+	pkg, note := "jdk", ""
+	if image == "jre" {
+		if feature == 8 && runtime.GOOS != "darwin" {
+			pkg = "jre"
+		} else {
+			note = jdkOnly
+		}
+	}
+	name := fmt.Sprintf("amazon-corretto-%d-%s-%s-%s.%s", feature, arch, osName, pkg, archiveExt())
+	sum, err := checksumFile(ctx, "https://corretto.aws/downloads/latest_sha256/"+name)
+	if err != nil {
+		return nil, fmt.Errorf("no Corretto %d for %s (%v)", feature, platform.Key(), err)
+	}
+	return &artifact{url: "https://corretto.aws/downloads/latest/" + name, sum: sum, name: name, note: note}, nil
+}
+
+// liberica uses the BellSoft Liberica API (publishes SHA-1 digests).
+func liberica(ctx context.Context, feature int, image string) (*artifact, error) {
+	osName := map[string]string{"windows": "windows", "darwin": "macos", "linux": "linux"}[runtime.GOOS]
+	if platform.IsMusl() {
+		osName = "linux-musl"
+	}
+	arch, bits := map[string]string{"amd64": "x86", "386": "x86", "arm64": "arm", "arm": "arm"}[runtime.GOARCH], "64"
+	if runtime.GOARCH == "386" || runtime.GOARCH == "arm" {
+		bits = "32"
+	}
+	if osName == "" || arch == "" {
+		return nil, fmt.Errorf("platform %s/%s is not supported by Liberica", runtime.GOOS, runtime.GOARCH)
+	}
+	q := url.Values{
+		"version-feature": {strconv.Itoa(feature)}, "version-modifier": {"latest"}, "release-type": {"ga"},
+		"os": {osName}, "arch": {arch}, "bitness": {bits}, "installation-type": {"archive"},
+		"package-type": {archiveExt()}, "bundle-type": {image}, "fx": {"false"},
+	}
+	var list []struct {
+		URL      string `json:"downloadUrl"`
+		SHA1     string `json:"sha1"`
+		Filename string `json:"filename"`
+	}
+	if err := fetch.JSON(ctx, "https://api.bell-sw.com/v1/liberica/releases?"+q.Encode(), &list); err != nil {
+		return nil, err
+	}
+	if len(list) == 0 || list[0].URL == "" {
+		return nil, fmt.Errorf("no Liberica %d %s build for %s", feature, image, platform.Key())
+	}
+	return &artifact{url: list[0].URL, sum: list[0].SHA1, name: list[0].Filename}, nil
+}
+
+// microsoft uses the Microsoft Build of OpenJDK "latest" links (JDK only,
+// Java 11, 17, 21 and newer LTS releases).
+func microsoft(ctx context.Context, feature int, image string) (*artifact, error) {
+	osName := map[string]string{"windows": "windows", "darwin": "macos", "linux": "linux"}[runtime.GOOS]
+	arch := map[string]string{"amd64": "x64", "arm64": "aarch64"}[runtime.GOARCH]
+	if osName == "" || arch == "" || platform.IsMusl() {
+		return nil, fmt.Errorf("platform %s/%s is not supported by Microsoft OpenJDK", runtime.GOOS, runtime.GOARCH)
+	}
+	name := fmt.Sprintf("microsoft-jdk-%d-%s-%s.%s", feature, osName, arch, archiveExt())
+	u := "https://aka.ms/download-jdk/" + name
+	sum, err := checksumFile(ctx, u+".sha256sum.txt")
+	if err != nil {
+		return nil, fmt.Errorf("no Microsoft OpenJDK %d for %s (%v)", feature, platform.Key(), err)
+	}
+	a := &artifact{url: u, sum: sum, name: name}
+	if image == "jre" {
+		a.note = jdkOnly
+	}
+	return a, nil
 }
 
 // adoptium uses the Eclipse Adoptium API (Temurin builds).
@@ -139,7 +258,7 @@ func adoptium(ctx context.Context, feature int, image string) (*artifact, error)
 	}
 	for _, r := range res {
 		if p := r.Binary.Package; p.Link != "" && r.Binary.ImageType == image {
-			return &artifact{url: p.Link, sha256: p.Checksum, name: p.Name}, nil
+			return &artifact{url: p.Link, sum: p.Checksum, name: p.Name}, nil
 		}
 	}
 	return nil, fmt.Errorf("no Temurin %d %s build for %s", feature, image, platform.Key())
@@ -155,12 +274,8 @@ func zulu(ctx context.Context, feature int, image string) (*artifact, error) {
 	if osName == "" || arch == "" {
 		return nil, fmt.Errorf("platform %s/%s is not supported by Azul", runtime.GOOS, runtime.GOARCH)
 	}
-	ext := "tar.gz"
-	if runtime.GOOS == "windows" {
-		ext = "zip"
-	}
 	q := url.Values{
-		"java_version": {strconv.Itoa(feature)}, "os": {osName}, "arch": {arch}, "archive_type": {ext},
+		"java_version": {strconv.Itoa(feature)}, "os": {osName}, "arch": {arch}, "archive_type": {archiveExt()},
 		"java_package_type": {image}, "javafx_bundled": {"false"}, "crac_supported": {"false"},
 		"latest": {"true"}, "release_status": {"ga"}, "availability_types": {"CA"},
 		"page": {"1"}, "page_size": {"1"},
@@ -182,7 +297,7 @@ func zulu(ctx context.Context, feature int, image string) (*artifact, error) {
 		SHA256 string `json:"sha256_hash"`
 	}
 	if err := fetch.JSON(ctx, api+url.PathEscape(list[0].UUID), &detail); err == nil {
-		a.sha256 = detail.SHA256
+		a.sum = detail.SHA256
 	}
 	return a, nil
 }
@@ -190,24 +305,18 @@ func zulu(ctx context.Context, feature int, image string) (*artifact, error) {
 // fromURL expands a URL template; sha256 may be a digest or a URL (template)
 // of a checksum file whose first token is the digest.
 func fromURL(ctx context.Context, src config.Source, feature int, image string) (*artifact, error) {
-	ext := "tar.gz"
-	if runtime.GOOS == "windows" {
-		ext = "zip"
-	}
 	expand := strings.NewReplacer("{version}", strconv.Itoa(feature), "{os}", platform.OS(),
-		"{arch}", platform.Arch(), "{image}", image, "{ext}", ext).Replace
-	a := &artifact{url: expand(src.URL), sha256: src.SHA256}
+		"{arch}", platform.Arch(), "{image}", image, "{ext}", archiveExt()).Replace
+	a := &artifact{url: expand(src.URL), sum: src.SHA256}
 	if u, err := url.Parse(a.url); err == nil {
 		a.name = path.Base(u.Path)
 	}
-	if strings.Contains(a.sha256, "://") {
-		txt, err := fetch.Text(ctx, expand(a.sha256))
+	if strings.Contains(a.sum, "://") {
+		sum, err := checksumFile(ctx, expand(a.sum))
 		if err != nil {
-			return nil, fmt.Errorf("checksum: %w", err)
+			return nil, err
 		}
-		if f := strings.Fields(txt); len(f) > 0 {
-			a.sha256 = f[0]
-		}
+		a.sum = sum
 	}
 	return a, nil
 }

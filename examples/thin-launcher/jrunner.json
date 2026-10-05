@@ -1,0 +1,14 @@
+{
+  "name": "Team Dashboard",
+  "id": "team-dashboard",
+  "version": "0.9.0",
+  "jar": "target/dashboard-0.9.0.jar",
+
+  "java": { "minVersion": 21 },
+
+  "browser": { "url": "http://localhost:9090/dashboard/" },
+
+  "update": { "url": "https://intranet.example.com/dashboard/update.json", "intervalHours": 0, "auto": true },
+
+  "install": { "menuShortcut": true }
+}

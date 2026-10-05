@@ -29,7 +29,7 @@ import (
 const flagPrefix = "--jrunner-"
 
 type options struct {
-	verbose, update, reinstall, uninstall, info, help bool
+	verbose, update, reinstall, uninstall, info, help, noBrowser bool
 }
 
 type launcher struct {
@@ -83,6 +83,8 @@ func parseArgs(args []string) (options, []string, error) {
 			o.info = true
 		case "help":
 			o.help = true
+		case "no-browser":
+			o.noBrowser = true
 		default:
 			return o, nil, fmt.Errorf("unknown launcher option %s (see %shelp)", a, flagPrefix)
 		}
@@ -109,20 +111,33 @@ func (l *launcher) run(appArgs []string) (int, error) {
 		return 0, nil
 	}
 
+	forceCheck := l.opts.update
 	if reason := l.installReason(installed); reason != "" {
-		if !l.embedded.HasApp {
-			return 1, fmt.Errorf("%s is not installed correctly in %s; please run the original installer again", l.cfg.Name, l.paths.Install)
-		}
-		ui.Step("%s %s: %s", l.cfg.Name, l.cfg.Version, reason)
+		ui.Title(l.cfg.Name, l.cfg.Version, reason)
 		if l.opts.reinstall {
 			l.state.Java = nil // look for Java again
 		}
-		if err := l.install(l.embedded, true); err != nil {
-			return 1, err
+		if l.embedded.HasApp {
+			if err := l.install(l.embedded, true); err != nil {
+				return 1, err
+			}
+		} else {
+			// A thin launcher carries only the configuration: fetch the
+			// application from the update channel.
+			if l.cfg.Update == nil {
+				return 1, fmt.Errorf("%s is not installed correctly in %s; please run the original installer again", l.cfg.Name, l.paths.Install)
+			}
+			if err := l.bootstrap(); err != nil {
+				return 1, err
+			}
 		}
 	} else {
-		if c := version.Compare(l.cfg.Version, installed.Version); c < 0 {
+		switch c := version.Compare(l.cfg.Version, installed.Version); {
+		case c < 0:
 			ui.Debug("installed version %s is newer than this launcher's %s, using it", installed.Version, l.cfg.Version)
+		case c > 0 && !l.embedded.HasApp:
+			// A newer thin launcher: look for the matching package now.
+			forceCheck = true
 		}
 		l.cfg = installed
 	}
@@ -131,8 +146,8 @@ func (l *launcher) run(appArgs []string) (int, error) {
 	if err := l.ensureJava(); err != nil {
 		return 1, err
 	}
-	if l.opts.update || l.updateDue() {
-		updated, err := l.checkUpdate(l.opts.update)
+	if forceCheck || l.updateDue() {
+		updated, err := l.checkUpdate(forceCheck)
 		if err != nil {
 			if l.opts.update {
 				return 1, err
@@ -223,19 +238,20 @@ func (l *launcher) resolveJava(req jre.Requirement) (*jre.Runtime, error) {
 		private = append(private, home)
 	}
 	if rt := jre.Find(req, private...); rt != nil {
-		ui.Info("using %s", rt)
+		ui.Success("using %s", rt)
 		return rt, nil
 	}
 	feature := l.cfg.DownloadFeature()
 	if !req.AcceptsFeature(feature) {
 		feature = req.Min
 	}
-	ui.Step("Java %s not found, downloading Java %d", req, feature)
+	ui.Info("no suitable Java installation found on this computer")
+	ui.Step("Downloading Java %d (%s, %s)", feature, l.cfg.Java.Image, platform.Key())
 	rt, err := jre.Download(context.Background(), l.cfg.Java.Download, feature, req, l.paths.Runtime)
 	if err != nil {
 		return nil, err
 	}
-	ui.Info("installed %s", rt)
+	ui.Success("installed %s", rt)
 	return rt, nil
 }
 
@@ -370,6 +386,7 @@ Launcher options:
   %[5]sreinstall   reinstall from this launcher and look for Java again
   %[5]suninstall   remove the application (your data is kept)
   %[5]sinfo        show installation details
+  %[5]sno-browser  do not open the browser (web applications)
   %[5]sverbose     print diagnostic output
   %[5]shelp        show this help
 

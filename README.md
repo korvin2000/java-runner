@@ -13,7 +13,32 @@ jrunner init target/demo-app.jar      # writes jrunner.json (detects Spring Boot
 jrunner build --target all            # dist/demo-app-1.0.0-windows-x64.exe, -linux-x64, -mac-aarch64, ...
 ```
 
-The user downloads one file and runs it.
+The user downloads one file and runs it. The first start looks like this:
+
+```
+Demo App 1.0.0  first launch, installing
+  location: C:\Users\anna\AppData\Local\Programs\Demo App
+  ✓ application files (48.2 MB)
+  ✓ created shortcut C:\Users\anna\Desktop\Demo App.lnk
+  ✓ installed Demo App 1.0.0
+▸ Looking for Java 17+
+  no suitable Java installation found on this computer
+▸ Downloading Java 21 (jre, windows-x64)
+  source 1/5: Eclipse Temurin (adoptium.net)
+  downloading OpenJDK21U-jre_x64_windows_hotspot_21.0.4_7.zip
+  [████████████████████████] 100%  44.1 MB / 44.1 MB  9.8 MB/s
+  ✓ downloaded 44.1 MB (4s)
+  ✓ checksum verified
+  ✓ Java 21.0.4+7-LTS works (2s)
+  ✓ installed Java 21.0.4+7-LTS (Eclipse Adoptium) at ...\runtime\jdk-21.0.4+7-jre
+▸ Starting Demo App
+  ... application log ...
+▸ Demo App is ready at http://localhost:8080/
+```
+
+Every later start prints nothing of its own and takes a few milliseconds
+before the JVM runs. Ready-made configurations for typical cases are in
+[`examples/`](examples/README.md).
 
 ## How it works
 
@@ -35,6 +60,8 @@ First launch (only once)                      Every later launch
   developer CLI. `jrunner build` appends an application package (a zip with
   `jrunner.json`, the jar and optionally a jlink runtime) to a copy of the
   jrunner binary for the target platform. That copy is the app's launcher.
+  With `--thin` the package contains only `jrunner.json`: such a launcher
+  (about 7 MB) downloads the application from `update.url` on first start.
 * **Per-user install, no admin rights.** Nothing is written outside the user profile.
 
   | | Program files | Data / working dir | Integration |
@@ -83,7 +110,7 @@ reported as errors, so typos are caught at build time.
     "args": []
   },
 
-  "browser": { "url": "http://localhost:8080/", "timeout": 120 },
+  "browser": { "url": "http://localhost:8080/", "timeout": 120 },   // or {} to detect the URL from the log
 
   "update": { "url": "https://example.com/demo-app/update.json", "intervalHours": 24, "auto": false },
 
@@ -100,15 +127,79 @@ reported as errors, so typos are caught at build time.
 | `java.minVersion` / `maxVersion` | Accepted feature releases (default 17 / any) |
 | `java.image` | `jre` (default) or `jdk` (requires `javac`, downloads a JDK) |
 | `java.downloadVersion` | Release to download if nothing suitable is installed (default `minVersion`) |
-| `java.download` | Sources, tried in order. `adoptium` (Eclipse Temurin) and `zulu` (Azul) use the vendors' APIs and verify published SHA-256 checksums. A URL template may use `{version} {os} {arch} {image} {ext}` (`os` = windows/linux/mac, `arch` = x64/aarch64, `ext` = zip on Windows, else tar.gz). Object form: `{"url": "...", "sha256": "<hex or URL of a checksum file>"}`. Default: `["adoptium", "zulu"]` |
+| `java.download` | Sources, tried in order until one delivers a working runtime (see *Java runtimes* below). A URL template may use `{version} {os} {arch} {image} {ext}` (`os` = windows/linux/mac, `arch` = x64/aarch64, `ext` = zip on Windows, else tar.gz). Object form: `{"url": "...", "sha256": "<hex or URL of a checksum file>"}`. Default: all five built-in providers |
 | `java.runtime` | Build time: a jlink image to bundle (may contain `{os}`, `{arch}`, `{platform}`). The app then never searches for or downloads Java |
-| `java.options` / `args` | JVM options and default app arguments. `${APP_DIR}`, `${INSTALL_DIR}`, `${DATA_DIR}`, `${HOME}`, `${VERSION}`, `${ID}` and `${ENV_VAR}` are expanded |
+| `java.options` / `args` | JVM options and default app arguments. `${APP_DIR}`, `${INSTALL_DIR}`, `${DATA_DIR}`, `${CWD}`, `${HOME}`, `${VERSION}`, `${ID}` and `${ENV_VAR}` are expanded |
 | `java.env` | Environment variables set for the application (same `${...}` expansion) |
 | `java.mainClass` + `classPath` | Start a class instead of `-jar` (entries relative to `app/`, `lib/*` allowed) |
 | `java.module` + `modulePath` | Modular app: `-p <modulePath> -m <module>/<main class>` |
-| `browser.url` | Web app (e.g. Spring Boot): after start, wait until the port accepts connections, then open the browser. If the port is already in use, the app is assumed to be running and only the browser is opened |
+| `browser.url` | Web app (e.g. Spring Boot): after start, wait until the port accepts connections, then open the browser. If the port is already in use, the app is assumed to be running and only the browser is opened. Leave the URL out (`"browser": {}`) to detect it from the application's log (see below) |
 | `update.url` | `update.json` location. Checks are rate-limited by `intervalHours` (0 = every launch), time out after 10 s and never block the app when offline. `auto: true` installs without asking |
 | `install.dir` | Override the install directory |
+
+## Java runtimes
+
+The launcher first looks for an installed Java that matches `java.minVersion`
+/ `maxVersion`, the CPU architecture and (for `"image": "jdk"`) has a compiler:
+its own `runtime/` directory, `<ID>_JAVA_HOME`, `JAVA_HOME`, `java` on the
+`PATH` (shims such as Oracle's `javapath` are resolved), then the usual
+installation directories of all major vendors, SDKMAN, IntelliJ's `~/.jdks`
+and Homebrew. The newest acceptable release wins.
+
+If nothing fits, `java.downloadVersion` is downloaded. The sources are tried
+in order; a source that has no build for this release or platform, is
+unreachable, delivers a bad checksum or a runtime that does not start is
+skipped with a warning and the next one is tried:
+
+| Source | Builds | Checksum | Notes |
+|---|---|---|---|
+| `adoptium` | Eclipse Temurin JRE + JDK, 8, 11, 17, 21, 25, ... | SHA-256 | Alpine/musl supported |
+| `zulu` | Azul Zulu JRE + JDK, every release incl. 9–16 | SHA-256 | Alpine/musl supported |
+| `corretto` | Amazon Corretto JDK (JRE only for 8), 8, 11, 17, 21, ... | SHA-256 | Alpine/musl supported |
+| `liberica` | BellSoft Liberica JRE + JDK, 8, 11, 17, 21, ... | SHA-1 | Alpine/musl supported |
+| `microsoft` | Microsoft Build of OpenJDK, JDK only, 11, 17, 21 | SHA-256 | |
+| URL template | your own mirror or minified JRE (`zip` / `tar.gz` with `bin/java`) | optional | |
+
+When a `jre` is requested and the vendor publishes only JDKs, the JDK is used
+(it is larger but equivalent). The official OpenJDK builds on jdk.java.net
+have no stable download addresses, so they are not a built-in source; Temurin
+is the reference build most distributions ship. The downloaded runtime is
+unpacked into `<install dir>/runtime`, test-run and remembered in `state.json`;
+it is downloaded once.
+
+## Web applications and the browser
+
+With `"browser": {"url": "http://localhost:8080/"}` the launcher starts the
+JVM, polls the port and opens the URL in the default browser when it accepts
+connections (`timeout` seconds, default 120).
+
+With `"browser": {}` the launcher reads the application's own output and opens
+the first local address it announces, for example:
+
+```
+Tomcat started on port 8080 (http) with context path '/shop'   → http://localhost:8080/shop/
+Netty started on port 9000                                     → http://localhost:9000/
+Studio is ready: http://127.0.0.1:8740/launch?t=0233d4...      → that URL
+  ➜  started on Local:   http://localhost:4200/                → http://localhost:4200/
+```
+
+Only addresses on this machine (`localhost`, `127.x`, `0.0.0.0`, `::1`, the
+host name) are considered, so links to documentation in log messages are
+ignored. This also works with `server.port=0` (random port). The launcher
+still waits for the port to accept connections before opening the browser.
+`jrunner init` configures this automatically for Spring Boot jars.
+`--jrunner-no-browser` starts the app without opening anything.
+
+## Thin launchers
+
+`jrunner build --thin` builds launchers that contain only the configuration
+(`dist/<id>-<version>-<target>-thin[.exe]`). On first start such a launcher
+downloads the application package from `update.url`, verifies it and installs
+it like the full installer would; afterwards it behaves exactly like a normal
+launcher (update checks included). Use it when the download page should always
+hand out the latest version, or when the application is large and changes
+often while the launcher stays the same. The update packages and `update.json`
+are written by the same `jrunner build` run.
 
 ## Launcher options
 
@@ -119,6 +210,7 @@ All arguments are passed to the application except these:
 --jrunner-reinstall   reinstall from this launcher and look for Java again
 --jrunner-uninstall   remove the app, shortcuts and PATH entry (user data is kept)
 --jrunner-info        show versions, paths, the Java in use, update status
+--jrunner-no-browser  do not open the browser (web applications)
 --jrunner-verbose     diagnostic output (also: JRUNNER_VERBOSE=1)
 --jrunner-help
 ```
@@ -183,7 +275,11 @@ Requires Go 1.22+.
 * **Console.** Launchers are console programs, so progress and app logs are visible.
   Desktop and menu shortcuts open a terminal on Linux and macOS. On Windows, a
   launcher started by double-click keeps its window open after an error until
-  Enter is pressed.
+  Enter is pressed. Colors and Unicode symbols are used on terminals that
+  support them (Windows Terminal, macOS Terminal, Linux); `NO_COLOR=1` turns
+  colors off. In URL-detection mode the application's output passes through the
+  launcher; Spring Boot keeps its log colors (`SPRING_OUTPUT_ANSI_ENABLED` is
+  set), other frameworks may switch them off because stdout is a pipe.
 * **Code signing.** The payload is appended to the executable. Windows
   Authenticode signing of the final `.exe` is supported, because the launcher finds
   its payload in front of the certificate table. macOS binaries are ad-hoc

@@ -52,10 +52,39 @@ type Java struct {
 	ModulePath      []string          `json:"modulePath,omitempty"`      // module path entries (with module)
 }
 
+// Providers are the built-in Java download sources (in default order) with
+// their labels for progress messages.
+var Providers = []struct{ Name, Label string }{
+	{"adoptium", "Eclipse Temurin (adoptium.net)"},
+	{"zulu", "Azul Zulu (azul.com)"},
+	{"corretto", "Amazon Corretto (corretto.aws)"},
+	{"liberica", "BellSoft Liberica (bell-sw.com)"},
+	{"microsoft", "Microsoft Build of OpenJDK (microsoft.com)"},
+}
+
+// DefaultSources returns the default download sources: all providers in order.
+func DefaultSources() []Source {
+	out := make([]Source, len(Providers))
+	for i, p := range Providers {
+		out[i] = Source{Provider: p.Name}
+	}
+	return out
+}
+
+// IsProvider reports whether name is a built-in provider.
+func IsProvider(name string) bool {
+	for _, p := range Providers {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Source is a place to download a Java runtime from. In JSON it may be an
-// object or a shorthand string: "adoptium", "zulu" or a URL template.
+// object or a shorthand string: a provider name or a URL template.
 type Source struct {
-	Provider string `json:"provider,omitempty"` // "adoptium" or "zulu"
+	Provider string `json:"provider,omitempty"` // see Providers
 	URL      string `json:"url,omitempty"`      // template with {version} {os} {arch} {image} {ext}
 	SHA256   string `json:"sha256,omitempty"`   // hex digest, or URL (template) of a checksum file
 }
@@ -78,11 +107,10 @@ func (s *Source) UnmarshalJSON(b []byte) error {
 
 // Label describes the source for progress messages.
 func (s Source) Label() string {
-	switch s.Provider {
-	case "adoptium":
-		return "Eclipse Temurin (adoptium.net)"
-	case "zulu":
-		return "Azul Zulu (azul.com)"
+	for _, p := range Providers {
+		if p.Name == s.Provider {
+			return p.Label
+		}
 	}
 	if u, err := url.Parse(s.URL); err == nil && u.Host != "" {
 		return u.Host
@@ -90,10 +118,13 @@ func (s Source) Label() string {
 	return s.URL
 }
 
-// Browser configures opening the application's web UI.
+// Browser configures opening the application's web UI. With an empty URL the
+// launcher detects the address from the application's log output (Spring
+// Boot's "Tomcat started on port 8080 (http) with context path '/'" or any
+// printed http://localhost... URL).
 type Browser struct {
-	URL     string `json:"url"`               // e.g. "http://localhost:8080/"
-	Timeout int    `json:"timeout,omitempty"` // seconds to wait for the port (default 120)
+	URL     string `json:"url,omitempty"`     // e.g. "http://localhost:8080/"; empty = detect from the log
+	Timeout int    `json:"timeout,omitempty"` // seconds to wait for the port / URL (default 120)
 }
 
 // Update configures the update channel.
@@ -173,7 +204,7 @@ func (c *Config) applyDefaults() {
 		c.Java.MinVersion = 17
 	}
 	if len(c.Java.Download) == 0 {
-		c.Java.Download = []Source{{Provider: "adoptium"}, {Provider: "zulu"}}
+		c.Java.Download = DefaultSources()
 	}
 	if c.Browser != nil && c.Browser.Timeout <= 0 {
 		c.Browser.Timeout = 120
@@ -203,13 +234,17 @@ func (c *Config) Validate() error {
 		add("java.maxVersion (%d) is lower than java.minVersion (%d)", c.Java.MaxVersion, c.Java.MinVersion)
 	}
 	for _, s := range c.Java.Download {
-		if s.URL == "" && s.Provider != "adoptium" && s.Provider != "zulu" {
-			add("java.download: unknown source %q (use \"adoptium\", \"zulu\" or a URL)", s.Provider)
+		if s.URL == "" && !IsProvider(s.Provider) {
+			names := make([]string, len(Providers))
+			for i, p := range Providers {
+				names[i] = p.Name
+			}
+			add("java.download: unknown source %q (use %s or a URL)", s.Provider, strings.Join(names, ", "))
 		}
 	}
-	if c.Browser != nil {
+	if c.Browser != nil && c.Browser.URL != "" {
 		if u, err := url.Parse(c.Browser.URL); err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-			add("browser.url must be an absolute http(s) URL such as http://localhost:8080/")
+			add("browser.url must be an absolute http(s) URL such as http://localhost:8080/, or empty to detect it from the log")
 		}
 	}
 	if c.Update != nil {

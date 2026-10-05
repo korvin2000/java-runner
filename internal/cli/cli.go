@@ -25,6 +25,8 @@ Usage:
                            targets: %s
       -o, --out DIR        output directory (default dist)
       --version VERSION    override the version in the configuration (CI builds)
+      --thin               build small launchers without the application; they
+                           download it from update.url on first start
       --stubs DIR          directory with jrunner-<target> stubs for other platforms
   jrunner jlink [options]                 create a minimal Java runtime with jlink
       --jar FILE           application jar (modules are detected with jdeps)
@@ -99,6 +101,7 @@ func cmdBuild(args []string) error {
 	fs.StringVar(&o.Out, "o", "dist", "output directory")
 	fs.StringVar(&o.Stubs, "stubs", "", "stub directory")
 	fs.StringVar(&o.Version, "version", "", "version override")
+	fs.BoolVar(&o.Thin, "thin", false, "thin launcher")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
